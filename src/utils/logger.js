@@ -240,7 +240,8 @@ function simplifyErrorText(error, context = {}) {
       lower.includes("asn1"))
   ) {
     result.summary = "Google Sheets authentication failed: invalid private key format";
-    result.likelyCause = "Check private_key in GOOGLE_APPLICATION_CREDENTIALS file";
+    result.likelyCause =
+      "Check private_key in GOOGLE_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS";
     return result;
   }
 

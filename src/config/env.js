@@ -1,4 +1,3 @@
-const fs = require("node:fs");
 const path = require("node:path");
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
@@ -115,37 +114,27 @@ function parseGoogleCredentialsJson(rawValue) {
   }
 }
 
-function bootstrapGoogleCredentialsFromEnv() {
+function resolveGoogleCredentialsState() {
   const rawCredentials = safeString(process.env.GOOGLE_CREDENTIALS_JSON);
   if (!rawCredentials) {
     return {
-      applied: false,
-      path: resolveGoogleCredentialsPath(),
-      error: ""
+      json: null,
+      error: "",
+      source: "file_path"
     };
   }
 
-  const targetPath = resolveGoogleCredentialsPath();
   try {
-    const parsedCredentials = parseGoogleCredentialsJson(rawCredentials);
-    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-    fs.writeFileSync(targetPath, `${JSON.stringify(parsedCredentials, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600
-    });
-
-    process.env.GOOGLE_APPLICATION_CREDENTIALS = targetPath;
-
     return {
-      applied: true,
-      path: targetPath,
-      error: ""
+      json: parseGoogleCredentialsJson(rawCredentials),
+      error: "",
+      source: "env_json"
     };
   } catch (error) {
     return {
-      applied: false,
-      path: targetPath,
-      error: safeString(error?.message || "Unable to write credentials JSON from env")
+      json: null,
+      error: safeString(error?.message || "GOOGLE_CREDENTIALS_JSON could not be parsed"),
+      source: "env_json"
     };
   }
 }
@@ -175,7 +164,7 @@ const resolvedGoogleWorksheetName = safeString(
   process.env.GOOGLE_SHEETS_WORKSHEET_NAME || process.env.GOOGLE_WORKSHEET_NAME,
   extractWorksheetNameFromRange(resolvedGoogleSheetsRange) || "Sheet1"
 );
-const credentialsBootstrap = bootstrapGoogleCredentialsFromEnv();
+const googleCredentialsState = resolveGoogleCredentialsState();
 const defaultDedupeStorePath = isProductionNodeEnv()
   ? path.resolve(RAILWAY_DATA_ROOT, "dedupe-store.json")
   : path.resolve(PROJECT_ROOT, "data/dedupe-store.json");
@@ -192,9 +181,9 @@ const env = Object.freeze({
   googleSheetsRange: resolvedGoogleSheetsRange,
   googleWorksheetName: resolvedGoogleWorksheetName,
   googleCredentialsPath: resolveGoogleCredentialsPath(),
-  googleCredentialsBootstrapApplied: credentialsBootstrap.applied,
-  googleCredentialsBootstrapPath: credentialsBootstrap.path,
-  googleCredentialsBootstrapError: credentialsBootstrap.error,
+  googleCredentialsJson: googleCredentialsState.json,
+  googleCredentialsJsonError: googleCredentialsState.error,
+  googleCredentialsSource: googleCredentialsState.source,
   whatsappClientId: safeString(process.env.WHATSAPP_CLIENT_ID),
   whatsappStartupTimeoutMs: parseNumber(process.env.WHATSAPP_STARTUP_TIMEOUT_MS, 90000, {
     integer: true,

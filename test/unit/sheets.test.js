@@ -28,7 +28,7 @@ test("validateSheetsConfig catches missing required values", () => {
 
   assert.equal(result.valid, false);
   assert.ok(result.missing.includes("GOOGLE_SHEETS_ID"));
-  assert.ok(result.missing.includes("GOOGLE_APPLICATION_CREDENTIALS"));
+  assert.ok(result.missing.includes("GOOGLE_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS"));
 });
 
 test("validateSheetsConfig detects invalid JSON credentials file", () => {
@@ -46,6 +46,22 @@ test("validateSheetsConfig detects invalid JSON credentials file", () => {
   assert.equal(result.credentialsStatus.code, "GOOGLE_CREDENTIALS_JSON_INVALID");
 
   cleanup(tempDir);
+});
+
+test("validateSheetsConfig accepts service account JSON directly from env-style input", () => {
+  const result = validateSheetsConfig({
+    spreadsheetId: "sheet-id",
+    worksheetName: "Sheet1",
+    credentialsJson: {
+      type: "service_account",
+      client_email: "bot@example.iam.gserviceaccount.com",
+      private_key: "-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----\\n"
+    }
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.credentialsStatus.code, "GOOGLE_CREDENTIALS_READY");
+  assert.equal(result.credentialsStatus.source, "env_json");
 });
 
 test("validateSheetsConfig detects missing required fields in credentials file", () => {

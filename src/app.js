@@ -177,18 +177,18 @@ async function bootstrap() {
     ...startupHealthSnapshot()
   });
 
-  if (env.googleCredentialsBootstrapError) {
+  if (env.googleCredentialsJsonError) {
     const startupError = new Error(
-      `Google credentials bootstrap failed: ${env.googleCredentialsBootstrapError}`
+      `Google credentials env parsing failed: ${env.googleCredentialsJsonError}`
     );
     startupError.code = "GOOGLE_CREDENTIALS_JSON_INVALID";
     throw startupError;
   }
 
-  if (env.googleCredentialsBootstrapApplied) {
-    logger.info("Google credentials file written from env", {
+  if (env.googleCredentialsSource === "env_json" && env.googleCredentialsJson) {
+    logger.info("Google credentials loaded from env", {
       stage: "sheets_startup",
-      reason: env.googleCredentialsBootstrapPath
+      reason: "GOOGLE_CREDENTIALS_JSON"
     });
   }
 
@@ -220,6 +220,7 @@ async function bootstrap() {
     spreadsheetId: env.googleSheetsId,
     worksheetName: env.googleWorksheetName,
     range: env.googleSheetsRange,
+    credentialsJson: env.googleCredentialsJson,
     credentialsPath: env.googleCredentialsPath
   });
   if (!sheetsStartupValidation.valid) {
@@ -281,6 +282,7 @@ async function bootstrap() {
     spreadsheetId: env.googleSheetsId,
     worksheetName: env.googleWorksheetName,
     range: env.googleSheetsRange,
+    credentialsJson: env.googleCredentialsJson,
     credentialsPath: env.googleCredentialsPath,
     logger: logger.child({ component: "sheets-client" })
   });
@@ -310,15 +312,17 @@ async function bootstrap() {
     sessionDir: sessionState.sessionPath,
     worksheetName: env.googleWorksheetName,
     geocodingProvider: env.geocodingProvider || "",
-    sheetsConfigured: Boolean(sheetsClient && env.googleSheetsId && env.googleCredentialsPath),
-    googleCredentialsPath: env.googleCredentialsPath,
+    sheetsConfigured: Boolean(sheetsClient && env.googleSheetsId),
+    googleCredentialsSource: env.googleCredentialsSource,
+    googleCredentialsPath:
+      env.googleCredentialsSource === "file_path" ? env.googleCredentialsPath : "",
     openaiConfigured: Boolean(env.openaiApiKey),
     dedupePersistence: env.dedupeStorePath
   };
 
   logger.info("Startup summary", {
     stage: "startup",
-    reason: `allowedGroups=${bootSummary.allowedGroups.length}, clientId=${bootSummary.whatsappClientId}, sessionDir=${bootSummary.sessionDir}, geocoder=${bootSummary.geocodingProvider}, sheetsConfigured=${bootSummary.sheetsConfigured}, openaiConfigured=${bootSummary.openaiConfigured}`
+    reason: `allowedGroups=${bootSummary.allowedGroups.length}, clientId=${bootSummary.whatsappClientId}, sessionDir=${bootSummary.sessionDir}, geocoder=${bootSummary.geocodingProvider}, sheetsConfigured=${bootSummary.sheetsConfigured}, sheetsCredentials=${bootSummary.googleCredentialsSource || "unknown"}, openaiConfigured=${bootSummary.openaiConfigured}`
   });
   logger.debug("Startup details", {
     stage: "startup",

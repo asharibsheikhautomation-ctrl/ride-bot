@@ -72,7 +72,7 @@ Behavior:
 - `WHATSAPP_STARTUP_TIMEOUT_MS` (default `90000`)
 - `GOOGLE_SHEETS_WORKSHEET_NAME` (default `Sheet1`)
 - `GOOGLE_SHEETS_RANGE` (default `<worksheet>!A:J`)
-- `GOOGLE_CREDENTIALS_JSON` (raw JSON or base64 JSON; written to file at startup)
+- `GOOGLE_CREDENTIALS_JSON` (raw JSON or base64 JSON; used directly in memory)
 - `GEOCODING_PROVIDER` (default `nominatim`)
 - `GEOCODING_BASE_URL` (default `https://nominatim.openstreetmap.org/search`)
 - `GEOCODING_USER_AGENT` (default `ride-bot/1.0 (geocode)`)
@@ -107,10 +107,10 @@ OPENAI_MODEL=gpt-4.1-mini
 GOOGLE_SHEETS_ID=
 GOOGLE_SHEETS_WORKSHEET_NAME=Sheet1
 GOOGLE_SHEETS_RANGE=Sheet1!A:J
-# Option A: mounted credentials file path
-GOOGLE_APPLICATION_CREDENTIALS=/data/credentials.json
-# Option B (Railway-friendly): inject JSON directly; app writes file at startup and sets GOOGLE_APPLICATION_CREDENTIALS automatically
+# Option A (recommended for Railway / env-based deploys): inject JSON directly
 GOOGLE_CREDENTIALS_JSON={"type":"service_account","project_id":"...","private_key_id":"...","private_key":"-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n","client_email":"...","client_id":"...","token_uri":"https://oauth2.googleapis.com/token"}
+# Option B: mounted credentials file path
+GOOGLE_APPLICATION_CREDENTIALS=/data/credentials.json
 
 GEOCODING_PROVIDER=nominatim
 GEOCODING_BASE_URL=https://nominatim.openstreetmap.org/search
@@ -127,19 +127,19 @@ DEDUPE_TTL_MS=21600000
 DEDUPE_MAX_ENTRIES=20000
 ```
 
-### Google `credentials.json` setup
+### Google service-account setup
 
 1. Download your service-account key JSON from Google Cloud.
-2. Place it at project root as `credentials.json` (or another secure path).
-3. Set `GOOGLE_APPLICATION_CREDENTIALS` to that file path.
-4. Open your target spreadsheet and share it with the `client_email` value inside `credentials.json` (Editor access recommended).
+2. Preferred: set `GOOGLE_CREDENTIALS_JSON` to the raw JSON string (or base64-encoded JSON).
+3. Alternative: place the file at a secure path and set `GOOGLE_APPLICATION_CREDENTIALS`.
+4. Open your target spreadsheet and share it with the `client_email` value inside the service-account JSON (Editor access recommended).
 
 Startup auth logs will clearly show:
 
-- `Google credentials file found`
-- `Google credentials file missing`
+- `Google credentials ready`
+- `Google credentials missing`
 - `Google credentials JSON is invalid`
-- `Google credentials file is missing required fields`
+- `Google credentials are missing required fields`
 - `Google Sheets auth ready`
 
 ## 5) Setup and Run

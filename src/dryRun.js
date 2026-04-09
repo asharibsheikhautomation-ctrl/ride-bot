@@ -365,6 +365,7 @@ async function runDryRun(options = {}) {
         spreadsheetId: env.googleSheetsId,
         worksheetName: env.googleWorksheetName,
         range: env.googleSheetsRange,
+        credentialsJson: env.googleCredentialsJson,
         credentialsPath: env.googleCredentialsPath,
         logger: logger.child({ component: "sheets-client" })
       });

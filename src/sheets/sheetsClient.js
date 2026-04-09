@@ -26,42 +26,10 @@ function resolveCredentialsPath(credentialsPath) {
   return path.isAbsolute(rawPath) ? rawPath : path.resolve(PROJECT_ROOT, rawPath);
 }
 
-function loadServiceAccountCredentials(credentialsPath) {
-  const resolvedPath = resolveCredentialsPath(credentialsPath);
-  if (!resolvedPath) {
-    return {
-      ok: false,
-      code: "GOOGLE_CREDENTIALS_PATH_MISSING",
-      message: "Google credentials file missing",
-      reason: "GOOGLE_APPLICATION_CREDENTIALS is not set",
-      path: ""
-    };
-  }
-
-  if (!fs.existsSync(resolvedPath)) {
-    return {
-      ok: false,
-      code: "GOOGLE_CREDENTIALS_FILE_MISSING",
-      message: "Google credentials file missing",
-      reason: resolvedPath,
-      path: resolvedPath
-    };
-  }
-
-  let parsed;
-  try {
-    const raw = fs.readFileSync(resolvedPath, "utf8");
-    parsed = JSON.parse(raw);
-  } catch (error) {
-    return {
-      ok: false,
-      code: "GOOGLE_CREDENTIALS_JSON_INVALID",
-      message: "Google credentials JSON is invalid",
-      reason: error?.message || "Invalid JSON syntax",
-      path: resolvedPath
-    };
-  }
-
+function validateServiceAccountCredentials(parsed, metadata = {}) {
+  const source = safeTrim(metadata.source, "unknown");
+  const sourceLabel = source === "env_json" ? "GOOGLE_CREDENTIALS_JSON" : "credentials file";
+  const sourcePath = safeTrim(metadata.path);
   const clientEmail = safeTrim(parsed?.client_email);
   const privateKey = normalizePrivateKey(parsed?.private_key);
   const accountType = safeTrim(parsed?.type);
@@ -77,20 +45,80 @@ function loadServiceAccountCredentials(credentialsPath) {
     return {
       ok: false,
       code: "GOOGLE_CREDENTIALS_FIELDS_MISSING",
-      message: "Google credentials file is missing required fields",
+      message: "Google credentials are missing required fields",
       reason: missingFields.join(", "),
-      path: resolvedPath
+      path: sourcePath,
+      source
     };
   }
 
   return {
     ok: true,
     code: "GOOGLE_CREDENTIALS_READY",
-    message: "Google credentials file found",
-    path: resolvedPath,
+    message: `Google credentials loaded from ${sourceLabel}`,
+    path: sourcePath,
+    source,
     clientEmail,
     privateKey
   };
+}
+
+function loadServiceAccountCredentials(input = {}) {
+  const config =
+    typeof input === "string"
+      ? { credentialsPath: input }
+      : input && typeof input === "object"
+        ? input
+        : {};
+
+  if (config.credentialsJson && typeof config.credentialsJson === "object") {
+    return validateServiceAccountCredentials(config.credentialsJson, {
+      source: "env_json"
+    });
+  }
+
+  const resolvedPath = resolveCredentialsPath(config.credentialsPath);
+  if (!resolvedPath) {
+    return {
+      ok: false,
+      code: "GOOGLE_CREDENTIALS_MISSING",
+      message: "Google credentials missing",
+      reason: "Set GOOGLE_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS",
+      path: "",
+      source: ""
+    };
+  }
+
+  if (!fs.existsSync(resolvedPath)) {
+    return {
+      ok: false,
+      code: "GOOGLE_CREDENTIALS_FILE_MISSING",
+      message: "Google credentials file missing",
+      reason: resolvedPath,
+      path: resolvedPath,
+      source: "file_path"
+    };
+  }
+
+  let parsed;
+  try {
+    const raw = fs.readFileSync(resolvedPath, "utf8");
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    return {
+      ok: false,
+      code: "GOOGLE_CREDENTIALS_JSON_INVALID",
+      message: "Google credentials JSON is invalid",
+      reason: error?.message || "Invalid JSON syntax",
+      path: resolvedPath,
+      source: "file_path"
+    };
+  }
+
+  return validateServiceAccountCredentials(parsed, {
+    source: "file_path",
+    path: resolvedPath
+  });
 }
 
 function resolveServiceAccountConfig(options = {}) {
@@ -98,22 +126,29 @@ function resolveServiceAccountConfig(options = {}) {
     spreadsheetId: safeTrim(options.spreadsheetId ?? env.googleSheetsId),
     worksheetName: safeTrim(options.worksheetName ?? env.googleWorksheetName),
     range: safeTrim(options.range ?? env.googleSheetsRange),
+    credentialsJson: options.credentialsJson ?? env.googleCredentialsJson,
     credentialsPath: safeTrim(options.credentialsPath ?? env.googleCredentialsPath)
   };
 }
 
 function validateSheetsConfig(config = {}) {
   const missing = [];
+  const hasCredentialsJson = Boolean(
+    config.credentialsJson && typeof config.credentialsJson === "object"
+  );
 
   if (!safeTrim(config.spreadsheetId)) missing.push("GOOGLE_SHEETS_ID");
   if (!safeTrim(config.worksheetName) && !safeTrim(config.range)) {
     missing.push("GOOGLE_SHEETS_WORKSHEET_NAME or GOOGLE_SHEETS_RANGE");
   }
-  if (!safeTrim(config.credentialsPath)) {
-    missing.push("GOOGLE_APPLICATION_CREDENTIALS");
+  if (!hasCredentialsJson && !safeTrim(config.credentialsPath)) {
+    missing.push("GOOGLE_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS");
   }
 
-  const credentialsStatus = loadServiceAccountCredentials(config.credentialsPath);
+  const credentialsStatus = loadServiceAccountCredentials({
+    credentialsJson: config.credentialsJson,
+    credentialsPath: config.credentialsPath
+  });
   const valid = missing.length === 0 && credentialsStatus.ok;
   const reason =
     missing.length > 0
@@ -152,7 +187,7 @@ function createSheetsClient(options = {}) {
     }
 
     if (validation.credentialsStatus?.code === "GOOGLE_CREDENTIALS_FIELDS_MISSING") {
-      logger.error("Google credentials file is missing required fields", {
+      logger.error("Google credentials are missing required fields", {
         stage: "sheets_auth",
         fallbackUsed: true,
         reason: validation.credentialsStatus.reason
@@ -160,7 +195,7 @@ function createSheetsClient(options = {}) {
       return null;
     }
 
-    logger.error("Google credentials file missing", {
+    logger.error("Google credentials missing", {
       stage: "sheets_auth",
       fallbackUsed: true,
       reason: validation.reason || validation.credentialsStatus?.reason || "Missing configuration"
@@ -170,9 +205,12 @@ function createSheetsClient(options = {}) {
 
   const credentials = validation.credentialsStatus;
 
-  logger.info("Google credentials file found", {
+  logger.info("Google credentials ready", {
     stage: "sheets_auth",
-    reason: credentials.path
+    reason:
+      credentials.source === "env_json"
+        ? "GOOGLE_CREDENTIALS_JSON"
+        : credentials.path || "GOOGLE_APPLICATION_CREDENTIALS"
   });
 
   try {
