@@ -1,0 +1,5 @@
+.env
+credentials.json
+storageState.json
+data/
+node_modules/

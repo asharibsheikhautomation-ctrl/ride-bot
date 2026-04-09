@@ -1,0 +1,34 @@
+{
+  "name": "ride-bot",
+  "version": "0.1.0",
+  "description": "Production-minded WhatsApp ride-processing bot (Node.js, modular).",
+  "main": "src/app.js",
+  "type": "commonjs",
+  "private": true,
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "check": "node -e \"require('./src/app')\"",
+    "dry-run": "node src/dryRun.js",
+    "dry-run:sample": "node src/dryRun.js --use-sample",
+    "test": "npm run test:unit && npm run test:smoke",
+    "test:unit": "node test/run.js unit",
+    "test:smoke": "node test/run.js smoke",
+    "test:integration": "node test/run.js integration"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.8.2",
+    "dotenv": "^16.5.0",
+    "googleapis": "^144.0.0",
+    "openai": "^5.12.0",
+    "puppeteer": "^24.6.1",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.26.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
