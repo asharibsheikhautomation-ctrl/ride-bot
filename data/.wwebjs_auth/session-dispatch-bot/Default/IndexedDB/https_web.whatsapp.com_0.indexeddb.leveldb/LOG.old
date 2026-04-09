@@ -1,0 +1,18 @@
+2026/03/27-13:27:46.521 2fb4 Reusing MANIFEST C:\Users\Online Laptop\Downloads\grupDataWhatsCli\grp\ride-bot\data\.wwebjs_auth\session-dispatch-bot\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/03/27-13:27:46.521 2fb4 Recovering log #90
+2026/03/27-13:27:46.671 2fb4 Reusing old log C:\Users\Online Laptop\Downloads\grupDataWhatsCli\grp\ride-bot\data\.wwebjs_auth\session-dispatch-bot\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/000090.log 
+2026/03/27-14:24:31.974 2fb4 Level-0 table #98: started
+2026/03/27-14:24:32.025 2fb4 Level-0 table #98: 1102141 bytes OK
+2026/03/27-14:24:32.027 2fb4 Delete type=0 #90
+2026/03/27-14:37:15.318 4288 Compacting 1@1 + 4@2 files
+2026/03/27-14:37:15.428 4288 Generated table #99@1: 27611 keys, 2187919 bytes
+2026/03/27-14:37:15.501 4288 Generated table #100@1: 21399 keys, 2177695 bytes
+2026/03/27-14:37:15.643 4288 Generated table #101@1: 105562 keys, 2256790 bytes
+2026/03/27-14:37:15.670 4288 Generated table #102@1: 14860 keys, 370152 bytes
+2026/03/27-14:37:15.670 4288 Compacted 1@1 + 4@2 files => 6992556 bytes
+2026/03/27-14:37:15.671 4288 compacted to: files[ 0 0 4 0 0 0 0 ]
+2026/03/27-14:37:15.672 4288 Delete type=2 #92
+2026/03/27-14:37:15.673 4288 Delete type=2 #93
+2026/03/27-14:37:15.674 4288 Delete type=2 #94
+2026/03/27-14:37:15.675 4288 Delete type=2 #95
+2026/03/27-14:37:15.675 4288 Delete type=2 #98
