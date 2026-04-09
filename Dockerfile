@@ -40,6 +40,6 @@ COPY src ./src
 COPY README.md ./README.md
 
 RUN mkdir -p /data /app/data
-VOLUME ["/data"]
+
 
 CMD ["node", "src/app.js"]
