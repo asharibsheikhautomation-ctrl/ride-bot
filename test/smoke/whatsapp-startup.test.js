@@ -27,6 +27,13 @@ class FakeWhatsAppClient extends EventEmitter {
       if (this.mode === "auth_failure") {
         this.emit("auth_failure", "invalid session");
       }
+      if (this.mode === "qr_then_ready") {
+        this.emit("qr", "FAKE-QR-TOKEN");
+        setTimeout(() => {
+          this.emit("authenticated");
+          this.emit("ready");
+        }, 15);
+      }
     }, 20);
   }
 
@@ -89,6 +96,44 @@ test("WhatsApp startup fails with explicit timeout code when ready does not arri
         return true;
       }
     );
+  } finally {
+    removeDirectory(tempPath);
+  }
+});
+
+test("WhatsApp startup saves QR image and reports state transitions", async () => {
+  const tempPath = createTempSessionPath();
+  const qrImagePath = path.join(tempPath, "qr.png");
+  const fakeClient = new FakeWhatsAppClient("qr_then_ready");
+  const states = [];
+
+  try {
+    await initializeWhatsAppClient({
+      sessionPath: tempPath,
+      clientId: "startup-qr",
+      startupTimeoutMs: 250,
+      startupTimeoutMinMs: 50,
+      persistedSessionDetected: false,
+      logger: createSilentLogger(),
+      qrRenderer: () => {},
+      qrImagePath,
+      qrImageGenerator: {
+        toFile: async (filePath, qrValue) => {
+          fs.writeFileSync(filePath, `png:${qrValue}`, "utf8");
+        }
+      },
+      onStateChange: (state) => {
+        states.push(state);
+      },
+      clientFactory: () => fakeClient
+    });
+
+    assert.equal(fakeClient.initializeCalled, true);
+    assert.ok(states.includes("starting"));
+    assert.ok(states.includes("qr_required"));
+    assert.ok(states.includes("authenticated"));
+    assert.ok(states.includes("ready"));
+    assert.equal(fs.existsSync(qrImagePath), false);
   } finally {
     removeDirectory(tempPath);
   }

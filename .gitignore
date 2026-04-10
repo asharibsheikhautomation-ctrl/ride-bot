@@ -1,5 +1,6 @@
 .env
 credentials.json
 storageState.json
-data/
+data/qr.png
+
 node_modules/

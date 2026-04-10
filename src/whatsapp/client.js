@@ -2,7 +2,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { Client, LocalAuth } = require("whatsapp-web.js");
-const qrcode = require("qrcode-terminal");
+const qrImage = require("qrcode");
+const terminalQr = require("qrcode-terminal");
 const { env } = require("../config/env");
 const { createLogger, summarizeKnownError } = require("../utils/logger");
 const { safeTrim } = require("../utils/text");
@@ -50,10 +51,44 @@ function isHeadlessEnabled(headlessValue) {
 
 function resolveTerminalQrRenderer(customRenderer) {
   if (typeof customRenderer === "function") return customRenderer;
-  if (qrcode && typeof qrcode.generate === "function") {
-    return (qrCode, options) => qrcode.generate(qrCode, options);
+  if (terminalQr && typeof terminalQr.generate === "function") {
+    return (qrCode, options) => terminalQr.generate(qrCode, options);
   }
   return null;
+}
+
+function resolveQrImageGenerator(customGenerator) {
+  if (customGenerator && typeof customGenerator.toFile === "function") return customGenerator;
+  if (qrImage && typeof qrImage.toFile === "function") return qrImage;
+  return null;
+}
+
+async function saveQrImageFile({ qrCode, qrImagePath, qrImageGenerator }) {
+  const targetPath = safeTrim(qrImagePath);
+  if (!targetPath) {
+    throw new Error("QR image path is not configured");
+  }
+
+  if (!qrImageGenerator || typeof qrImageGenerator.toFile !== "function") {
+    throw new Error("QR PNG generator is unavailable");
+  }
+
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  await qrImageGenerator.toFile(targetPath, String(qrCode || ""), {
+    type: "png",
+    width: 320,
+    margin: 2
+  });
+
+  return targetPath;
+}
+
+function clearQrImageFile(qrImagePath) {
+  const targetPath = safeTrim(qrImagePath);
+  if (!targetPath || !fs.existsSync(targetPath)) return false;
+
+  fs.unlinkSync(targetPath);
+  return true;
 }
 
 function saveQrFallbackFile({ qrCode, clientId }) {
@@ -137,6 +172,20 @@ function createStartupTracker({ startupTimeoutMs, persistedSessionDetected }) {
     isReady: () => ready,
     isSettled: () => settled
   };
+}
+
+function emitStateChange({ onStateChange, logger }, state, details = {}) {
+  if (typeof onStateChange !== "function") return;
+
+  try {
+    onStateChange(state, details);
+  } catch (error) {
+    logger.warn("WhatsApp state callback failed", {
+      stage: "whatsapp_auth",
+      fallbackUsed: true,
+      reason: safeTrim(error?.message) || "Unknown state callback error"
+    });
+  }
 }
 
 function buildStartupTimeoutHint({ tracker, persistedSessionDetected }) {
@@ -245,6 +294,9 @@ function attachLifecycleListeners({
   startupTimeoutMs,
   persistedSessionDetected,
   qrRenderer,
+  qrImagePath,
+  qrImageGenerator,
+  onStateChange,
   clientId,
   headlessEnabled
 }) {
@@ -267,6 +319,10 @@ function attachLifecycleListeners({
   }
 
   tracker.pushState("init_started", "client initialization started");
+  emitStateChange({ onStateChange, logger }, "starting", {
+    qrAvailable: false,
+    qrImagePath
+  });
 
   if (persistedSessionDetected) {
     tracker.pushState("persisted_session_detected", "saved auth session found");
@@ -300,11 +356,49 @@ function attachLifecycleListeners({
     rejectStartup(timeoutError);
   }, startupTimeoutMs);
 
-  client.on("qr", (qrCode) => {
+  client.on("qr", async (qrCode) => {
     tracker.pushState("qr_required", "no valid persisted session");
+    emitStateChange({ onStateChange, logger }, "qr_required", {
+      qrAvailable: false,
+      qrImagePath
+    });
     logger.info("QR required because no valid session exists", {
       stage: "whatsapp_auth"
     });
+
+    try {
+      const savedQrPath = await saveQrImageFile({
+        qrCode,
+        qrImagePath,
+        qrImageGenerator: resolveQrImageGenerator(qrImageGenerator)
+      });
+      const qrUpdatedAt = new Date().toISOString();
+
+      emitStateChange({ onStateChange, logger }, "qr_required", {
+        qrAvailable: true,
+        qrImagePath: savedQrPath,
+        qrUpdatedAt,
+        error: ""
+      });
+
+      logger.info("QR generated and saved", {
+        stage: "whatsapp_auth",
+        reason: savedQrPath
+      });
+    } catch (error) {
+      emitStateChange({ onStateChange, logger }, "qr_required", {
+        qrAvailable: false,
+        qrImagePath,
+        error: safeTrim(error?.message) || "Unable to save QR PNG"
+      });
+
+      logger.warn("QR generated but PNG save failed", {
+        stage: "whatsapp_auth",
+        fallbackUsed: true,
+        reason: safeTrim(qrImagePath) || "QR image path unavailable",
+        error
+      });
+    }
 
     const terminalRenderer = resolveTerminalQrRenderer(qrRenderer);
     const terminalAvailable = Boolean(process.stdout && process.stdout.isTTY);
@@ -365,6 +459,10 @@ function attachLifecycleListeners({
 
   client.on("authenticated", () => {
     tracker.pushState("authenticated", "session accepted");
+    emitStateChange({ onStateChange, logger }, "authenticated", {
+      qrAvailable: false,
+      qrImagePath
+    });
     logger.info("WhatsApp authenticated", {
       stage: "whatsapp_auth"
     });
@@ -373,8 +471,30 @@ function attachLifecycleListeners({
   client.on("ready", () => {
     tracker.pushState("ready", "client ready");
     tracker.setReady(true);
+    let qrRemoved = false;
+
+    try {
+      qrRemoved = clearQrImageFile(qrImagePath);
+    } catch (error) {
+      logger.warn("Unable to clear stale QR image", {
+        stage: "whatsapp_auth",
+        fallbackUsed: true,
+        reason: safeTrim(qrImagePath) || "QR image path unavailable",
+        error
+      });
+    }
+
+    emitStateChange({ onStateChange, logger }, "ready", {
+      qrAvailable: false,
+      qrImagePath,
+      error: ""
+    });
     logger.info("WhatsApp connected", {
       stage: "whatsapp_connect"
+    });
+    logger.info("Bot ready; QR not required", {
+      stage: "whatsapp_connect",
+      reason: qrRemoved ? "stale QR removed" : "no QR file to remove"
     });
     resolveStartup();
   });
@@ -382,6 +502,11 @@ function attachLifecycleListeners({
   client.on("auth_failure", (message) => {
     tracker.pushState("auth_failed", safeTrim(message) || "authentication failed");
     const reason = safeTrim(message) || "Saved session is invalid or expired";
+    emitStateChange({ onStateChange, logger }, "auth_failed", {
+      qrAvailable: false,
+      qrImagePath,
+      error: reason
+    });
     const startupError = createStartupError("WhatsApp authentication failed", "WHATSAPP_AUTH_FAILED", {
       stage: "whatsapp_auth",
       likelyCause: reason
@@ -545,6 +670,9 @@ async function initializeWhatsAppClient(options = {}) {
     startupTimeoutMs,
     persistedSessionDetected,
     qrRenderer: options.qrRenderer,
+    qrImagePath: options.qrImagePath,
+    qrImageGenerator: options.qrImageGenerator,
+    onStateChange: options.onStateChange,
     clientId: resolvedPaths.clientId,
     headlessEnabled
   });

@@ -1,3 +1,6 @@
+const fs = require("node:fs");
+const path = require("node:path");
+const express = require("express");
 const { env } = require("./config/env");
 const { createLogger, summarizeKnownError } = require("./utils/logger");
 const { DedupeStore } = require("./utils/dedupe");
@@ -19,6 +22,190 @@ const RAILWAY_PUPPETEER_ARGS = [
   "--no-zygote",
   "--single-process"
 ];
+
+function safeString(value, fallback = "") {
+  if (value === null || value === undefined) return fallback;
+  const normalized = String(value).trim();
+  return normalized.length > 0 ? normalized : fallback;
+}
+
+function resolveQrImagePath() {
+  const preferredDir = "/data";
+
+  try {
+    if (fs.existsSync(preferredDir) && fs.statSync(preferredDir).isDirectory()) {
+      return path.join(preferredDir, "qr.png");
+    }
+  } catch (error) {
+    // Fall back to project-local writable storage when /data is unavailable.
+  }
+
+  return path.resolve(__dirname, "../data/qr.png");
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function describeBotState(state) {
+  switch (state) {
+    case "qr_required":
+      return "Scan this QR with WhatsApp Linked Devices.";
+    case "authenticated":
+      return "Authentication complete. Waiting for ready state.";
+    case "ready":
+      return "Bot is ready, QR not required.";
+    case "auth_failed":
+      return "Authentication failed. Check logs and wait for a fresh QR.";
+    case "starting":
+    default:
+      return "Bot is starting.";
+  }
+}
+
+function createBotRuntimeStatus() {
+  const snapshot = {
+    state: "starting",
+    qrImagePath: resolveQrImagePath(),
+    qrAvailable: false,
+    qrUpdatedAt: "",
+    lastError: "",
+    startedAt: new Date().toISOString()
+  };
+
+  return {
+    update(state, details = {}) {
+      const nextState = safeString(state);
+      if (nextState) snapshot.state = nextState;
+
+      if (typeof details.qrAvailable === "boolean") {
+        snapshot.qrAvailable = details.qrAvailable;
+      }
+
+      if (safeString(details.qrUpdatedAt)) {
+        snapshot.qrUpdatedAt = safeString(details.qrUpdatedAt);
+      }
+
+      if (safeString(details.qrImagePath)) {
+        snapshot.qrImagePath = safeString(details.qrImagePath);
+      }
+
+      if (Object.prototype.hasOwnProperty.call(details, "error")) {
+        snapshot.lastError = safeString(details.error);
+      } else if (nextState !== "auth_failed") {
+        snapshot.lastError = "";
+      }
+    },
+    getSnapshot() {
+      const qrAvailable = Boolean(
+        snapshot.qrAvailable &&
+          safeString(snapshot.qrImagePath) &&
+          fs.existsSync(snapshot.qrImagePath)
+      );
+
+      return {
+        ok: true,
+        state: snapshot.state,
+        qrAvailable,
+        qrImagePath: snapshot.qrImagePath,
+        qrUpdatedAt: snapshot.qrUpdatedAt,
+        lastError: snapshot.lastError,
+        startedAt: snapshot.startedAt
+      };
+    }
+  };
+}
+
+function renderQrPage(status) {
+  const title = "Ride Bot QR";
+  const stateLabel = escapeHtml(status.state);
+  const statusMessage = escapeHtml(describeBotState(status.state));
+  const lastUpdated = escapeHtml(status.qrUpdatedAt || "not generated yet");
+  const imageBlock = status.qrAvailable
+    ? `<img src="/qr.png?ts=${encodeURIComponent(status.qrUpdatedAt || Date.now())}" alt="WhatsApp QR" style="max-width:320px;width:100%;height:auto;border:1px solid #d0d7de;border-radius:12px;background:#fff;padding:12px;" />`
+    : `<p style="margin:0;color:#57606a;">No QR image is currently available.</p>`;
+  const extraMessage =
+    status.state === "ready"
+      ? `<p style="margin:0;color:#1a7f37;">Bot is ready, QR not required.</p>`
+      : status.lastError
+        ? `<p style="margin:0;color:#d1242f;">${escapeHtml(status.lastError)}</p>`
+        : "";
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${title}</title>
+  </head>
+  <body style="font-family:Segoe UI,Arial,sans-serif;background:#f6f8fa;color:#24292f;margin:0;padding:24px;">
+    <main style="max-width:480px;margin:0 auto;background:#ffffff;border:1px solid #d0d7de;border-radius:16px;padding:24px;box-shadow:0 10px 30px rgba(31,35,40,.08);">
+      <h1 style="margin-top:0;">${title}</h1>
+      <p style="margin:0 0 8px;"><strong>State:</strong> ${stateLabel}</p>
+      <p style="margin:0 0 16px;">${statusMessage}</p>
+      ${extraMessage}
+      <div style="display:flex;justify-content:center;align-items:center;min-height:180px;margin:16px 0;">
+        ${imageBlock}
+      </div>
+      <p style="margin:0;color:#57606a;"><strong>QR updated:</strong> ${lastUpdated}</p>
+      <p style="margin:12px 0 0;color:#57606a;">Refresh this page if the state changes.</p>
+    </main>
+  </body>
+</html>`;
+}
+
+function startHttpServer({ logger, runtimeStatus, port }) {
+  const app = express();
+
+  app.get("/health", (_request, response) => {
+    const status = runtimeStatus.getSnapshot();
+    response.json({
+      ok: true,
+      state: status.state
+    });
+  });
+
+  app.get("/qr.png", (_request, response) => {
+    const status = runtimeStatus.getSnapshot();
+
+    if (!status.qrAvailable) {
+      response.status(404).json({
+        ok: false,
+        state: status.state,
+        message: "QR image not available"
+      });
+      return;
+    }
+
+    response.setHeader("Cache-Control", "no-store");
+    response.sendFile(status.qrImagePath);
+  });
+
+  app.get("/qr", (_request, response) => {
+    const status = runtimeStatus.getSnapshot();
+    response.setHeader("Cache-Control", "no-store");
+    response.type("html").send(renderQrPage(status));
+  });
+
+  return new Promise((resolve, reject) => {
+    const server = app.listen(port, () => {
+      logger.info("QR route available", {
+        stage: "http_server",
+        reason: `port=${port} /health /qr /qr.png`
+      });
+      resolve(server);
+    });
+
+    server.on("error", (error) => {
+      reject(error);
+    });
+  });
+}
 
 function startupHealthSnapshot() {
   const memory = process.memoryUsage();
@@ -78,7 +265,7 @@ function registerProcessHandlers(logger) {
   });
 }
 
-function registerShutdownHooks({ logger, getClient, getDedupe, sessionPath }) {
+function registerShutdownHooks({ logger, getClient, getDedupe, getServer, sessionPath }) {
   let shuttingDown = false;
 
   async function shutdown(signal) {
@@ -135,6 +322,26 @@ function registerShutdownHooks({ logger, getClient, getDedupe, sessionPath }) {
       }
     }
 
+    const server = typeof getServer === "function" ? getServer() : null;
+    if (server && typeof server.close === "function" && server.listening) {
+      await new Promise((resolve) => {
+        server.close((error) => {
+          if (error) {
+            logger.warn("HTTP server close issue during shutdown", {
+              stage: "shutdown",
+              fallbackUsed: true,
+              error
+            });
+          } else {
+            logger.info("HTTP server closed", {
+              stage: "shutdown"
+            });
+          }
+          resolve();
+        });
+      });
+    }
+
     logger.info("Service stopped", {
       stage: "shutdown",
       reason: sessionPath || ""
@@ -160,10 +367,13 @@ async function bootstrap() {
   registerProcessHandlers(logger);
   let clientRef = null;
   let dedupeRef = null;
+  let serverRef = null;
+  const runtimeStatus = createBotRuntimeStatus();
   registerShutdownHooks({
     logger,
     getClient: () => clientRef,
     getDedupe: () => dedupeRef,
+    getServer: () => serverRef,
     sessionPath: env.whatsappSessionPath
   });
 
@@ -175,6 +385,12 @@ async function bootstrap() {
   logger.debug("Startup diagnostics", {
     stage: "startup",
     ...startupHealthSnapshot()
+  });
+
+  serverRef = await startHttpServer({
+    logger: logger.child({ component: "http-server" }),
+    runtimeStatus,
+    port: env.port
   });
 
   if (env.googleCredentialsJsonError) {
@@ -355,6 +571,10 @@ async function bootstrap() {
     clientId: sessionState.clientId,
     startupTimeoutMs: env.whatsappStartupTimeoutMs,
     persistedSessionDetected: sessionState.sessionFolderHasData,
+    qrImagePath: runtimeStatus.getSnapshot().qrImagePath,
+    onStateChange: (state, details = {}) => {
+      runtimeStatus.update(state, details);
+    },
     logger: logger.child({ component: "whatsapp-client" }),
     puppeteer: resolvePuppeteerOptions(),
     onMessage
@@ -365,7 +585,7 @@ async function bootstrap() {
     stage: "whatsapp_connect"
   });
 
-  return { client };
+  return { client, server: serverRef };
 }
 
 function formatStartupError(error) {
