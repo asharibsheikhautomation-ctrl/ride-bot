@@ -3,7 +3,9 @@ FROM node:20-bookworm-slim
 ENV NODE_ENV=production
 ENV WHATSAPP_SESSION_PATH=/data/.wwebjs_auth
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false
+
 WORKDIR /app
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
   fonts-liberation \
@@ -31,8 +33,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   libxtst6 \
   xdg-utils \
   && rm -rf /var/lib/apt/lists/*
-headless: false
-  
 
 COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
@@ -41,6 +41,5 @@ COPY src ./src
 COPY README.md ./README.md
 
 RUN mkdir -p /data /app/data
-
 
 CMD ["node", "src/app.js"]
