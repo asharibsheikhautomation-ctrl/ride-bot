@@ -4,7 +4,11 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { validateSheetsConfig } = require("../../src/sheets/sheetsClient");
-const { classifyAppendFailure, buildAppendRange } = require("../../src/sheets/appendRow");
+const {
+  classifyAppendFailure,
+  buildAppendRange,
+  buildSheetRow
+} = require("../../src/sheets/appendRow");
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "ride-bot-sheets-test-"));
@@ -87,7 +91,74 @@ test("buildAppendRange uses quoted worksheet names safely", () => {
     worksheetName: "Ride Sheet"
   });
 
-  assert.equal(range, "'Ride Sheet'!A:J");
+  assert.equal(range, "'Ride Sheet'");
+});
+
+test("buildSheetRow maps canonical headers by name", () => {
+  const row = buildSheetRow(
+    {
+      refer: "RID-20260415-AB12",
+      source_name: "whatsapp",
+      group_name: "Dispatch Group",
+      pickup_date: "7th October 2025",
+      pickup_time: "20:05 pm",
+      final_fare: "\u00A350",
+      special_notes: "Flight: VY6652"
+    },
+    ["refer", "group_name", "pickup_date", "pickup_time", "final_fare", "special_notes"]
+  );
+
+  assert.deepEqual(row, [
+    "RID-20260415-AB12",
+    "Dispatch Group",
+    "7th October 2025",
+    "20:05 pm",
+    "\u00A350",
+    "Flight: VY6652"
+  ]);
+});
+
+test("buildSheetRow keeps legacy 10-column headers working via header mapping", () => {
+  const row = buildSheetRow(
+    {
+      refer: "RID-20260415-AB12",
+      day_label: "Tuesday",
+      pickup_date: "7th October 2025",
+      pickup_time: "20:05 pm",
+      pickup: "Heathrow Airport, Terminal 4",
+      drop_off: "12 Woodlands Close",
+      distance: "10.0 km",
+      final_fare: "\u00A350",
+      required_vehicle: "Saloon Car",
+      expiry: "",
+      expiry_utc: ""
+    },
+    [
+      "Refer",
+      "Day & Date",
+      "Starting",
+      "Pickup",
+      "Drop Off",
+      "Distance",
+      "Fare",
+      "Required Vehicle",
+      "Expires",
+      "Expires UTC"
+    ]
+  );
+
+  assert.deepEqual(row, [
+    "RID-20260415-AB12",
+    "Tuesday 7th October 2025",
+    "20:05 pm",
+    "Heathrow Airport, Terminal 4",
+    "12 Woodlands Close",
+    "10.0 km",
+    "\u00A350",
+    "Saloon Car",
+    "",
+    ""
+  ]);
 });
 
 test("classifyAppendFailure distinguishes common Google Sheets failures", () => {

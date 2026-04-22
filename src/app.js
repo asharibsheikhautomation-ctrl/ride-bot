@@ -6,6 +6,8 @@ const { createLogger, summarizeKnownError } = require("./utils/logger");
 const { DedupeStore } = require("./utils/dedupe");
 const { createLocalExtractor } = require("./extraction/localExtractor");
 const { createOpenAiNormalizer } = require("./extraction/openaiNormalizer");
+const { createTesseractOcr } = require("./extraction/tesseractOcr");
+const { normalizeHeaderName } = require("./extraction/schemas");
 const { createGeocoder } = require("./routing/geocode");
 const { createOsrmClient } = require("./routing/osrm");
 const { createSheetsClient, validateSheetsConfig } = require("./sheets/sheetsClient");
@@ -224,10 +226,89 @@ function resolvePuppeteerOptions() {
     return {};
   }
 
+  if (process.platform === "win32") {
+    return {
+      headless: true
+    };
+  }
+
   return {
     headless: true,
     args: RAILWAY_PUPPETEER_ARGS
   };
+}
+
+async function verifyWorksheetTargetsReady({
+  sheetsClient,
+  spreadsheetId,
+  worksheetTargets,
+  logger
+}) {
+  if (!sheetsClient || !spreadsheetId) {
+    throw new Error("Google Sheets client is not ready for worksheet verification");
+  }
+
+  const response = await sheetsClient.spreadsheets.get({
+    spreadsheetId,
+    fields: "sheets(properties(title))"
+  });
+  const existingTitles = new Set(
+    (Array.isArray(response?.data?.sheets) ? response.data.sheets : [])
+      .map((sheet) => safeString(sheet?.properties?.title))
+      .filter(Boolean)
+  );
+
+  const targets = Array.isArray(worksheetTargets) ? worksheetTargets : [];
+  const missing = targets
+    .map((target) => safeString(target?.worksheetName))
+    .filter(
+      (worksheetName) => safeString(worksheetName) && !existingTitles.has(safeString(worksheetName))
+    );
+
+  if (missing.length > 0) {
+    const error = new Error(`Missing Google Sheets worksheets: ${missing.join(", ")}`);
+    error.code = "SHEETS_WORKSHEETS_MISSING";
+    error.details = {
+      missing,
+      existing: [...existingTitles]
+    };
+    throw error;
+  }
+
+  for (const target of targets) {
+    const worksheetName = safeString(target?.worksheetName);
+    const minimumHeaders = Array.isArray(target?.minimumHeaders) ? target.minimumHeaders : [];
+    const headerResponse = await sheetsClient.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${worksheetName.replace(/'/g, "''")}'!1:1`
+    });
+    const rawHeaders = Array.isArray(headerResponse?.data?.values?.[0])
+      ? headerResponse.data.values[0]
+      : [];
+    const normalizedHeaders = new Set(rawHeaders.map((header) => normalizeHeaderName(header)));
+    const missingHeaders = minimumHeaders.filter(
+      (header) => !normalizedHeaders.has(normalizeHeaderName(header))
+    );
+
+    if (missingHeaders.length > 0) {
+      const error = new Error(
+        `Worksheet ${worksheetName} is missing required headers: ${missingHeaders.join(", ")}`
+      );
+      error.code = "SHEETS_HEADERS_MISSING";
+      error.details = {
+        worksheetName,
+        missingHeaders,
+        headers: rawHeaders
+      };
+      throw error;
+    }
+  }
+
+  logger.info("Google Sheets worksheet targets verified", {
+    stage: "sheets_startup",
+    fallbackUsed: false,
+    reason: targets.map((target) => target.worksheetName).join(", ")
+  });
 }
 
 function registerProcessHandlers(logger) {
@@ -432,36 +513,49 @@ async function bootstrap() {
     }
   );
 
-  const sheetsStartupValidation = validateSheetsConfig({
-    spreadsheetId: env.googleSheetsId,
-    worksheetName: env.googleWorksheetName,
-    range: env.googleSheetsRange,
-    credentialsJson: env.googleCredentialsJson,
-    credentialsPath: env.googleCredentialsPath
-  });
-  if (!sheetsStartupValidation.valid) {
-    const sheetsReason =
-      sheetsStartupValidation.reason ||
-      sheetsStartupValidation.credentialsStatus?.message ||
-      sheetsStartupValidation.missing.join(", ");
-    const startupError = new Error(
-      `Google Sheets startup validation failed: ${sheetsReason}`
-    );
-    startupError.code = "SHEETS_STARTUP_CONFIG_MISSING";
+  const startupSheetTargets = [
+    {
+      worksheetName: env.googleRidesWorksheetName,
+      range: env.googleRidesRange
+    },
+    {
+      worksheetName: env.googleNeedsReviewWorksheetName,
+      range: env.googleNeedsReviewRange
+    }
+  ];
 
-    logger.error("Google Sheets startup validation failed", {
-      stage: "sheets_startup",
-      fallbackUsed: true,
-      reason: sheetsReason
+  for (const target of startupSheetTargets) {
+    const sheetsStartupValidation = validateSheetsConfig({
+      spreadsheetId: env.googleSheetsId,
+      worksheetName: target.worksheetName,
+      range: target.range,
+      credentialsJson: env.googleCredentialsJson,
+      credentialsPath: env.googleCredentialsPath
     });
-    throw startupError;
-  } else {
-    logger.info("Google Sheets startup validation passed", {
-      stage: "sheets_startup",
-      fallbackUsed: false,
-      reason: `worksheet=${env.googleWorksheetName}`
-    });
+    if (!sheetsStartupValidation.valid) {
+      const sheetsReason =
+        sheetsStartupValidation.reason ||
+        sheetsStartupValidation.credentialsStatus?.message ||
+        sheetsStartupValidation.missing.join(", ");
+      const startupError = new Error(
+        `Google Sheets startup validation failed: ${sheetsReason}`
+      );
+      startupError.code = "SHEETS_STARTUP_CONFIG_MISSING";
+
+      logger.error("Google Sheets startup validation failed", {
+        stage: "sheets_startup",
+        fallbackUsed: true,
+        reason: `${target.worksheetName}: ${sheetsReason}`
+      });
+      throw startupError;
+    }
   }
+
+  logger.info("Google Sheets startup validation passed", {
+    stage: "sheets_startup",
+    fallbackUsed: false,
+    reason: `worksheets=${env.googleRidesWorksheetName},${env.googleNeedsReviewWorksheetName}`
+  });
 
   const dedupe = new DedupeStore({
     ttlMs: env.dedupeTtlMs,
@@ -481,6 +575,13 @@ async function bootstrap() {
     logger: logger.child({ component: "openai-normalizer" })
   });
 
+  const ocrExtractor = createTesseractOcr({
+    tesseractPath: env.ocrTesseractPath,
+    timeoutMs: env.ocrTimeoutMs,
+    tempDir: env.ocrTempDir,
+    logger: logger.child({ component: "ocr" })
+  });
+
   const geocoder = createGeocoder({
     provider: env.geocodingProvider,
     apiKey: env.geocodingApiKey,
@@ -496,19 +597,43 @@ async function bootstrap() {
 
   const sheetsClient = createSheetsClient({
     spreadsheetId: env.googleSheetsId,
-    worksheetName: env.googleWorksheetName,
-    range: env.googleSheetsRange,
+    worksheetName: env.googleRidesWorksheetName,
+    range: env.googleRidesRange,
     credentialsJson: env.googleCredentialsJson,
     credentialsPath: env.googleCredentialsPath,
     logger: logger.child({ component: "sheets-client" })
   });
 
-  const appendRow = createAppendRow({
+  await verifyWorksheetTargetsReady({
     sheetsClient,
     spreadsheetId: env.googleSheetsId,
-    worksheetName: env.googleWorksheetName,
-    range: env.googleSheetsRange,
-    logger: logger.child({ component: "sheets-append" })
+    worksheetTargets: [
+      {
+        worksheetName: env.googleRidesWorksheetName,
+        minimumHeaders: ["Refer", "Pickup", "Drop Off", "Raw Message"]
+      },
+      {
+        worksheetName: env.googleNeedsReviewWorksheetName,
+        minimumHeaders: ["Raw Message"]
+      }
+    ],
+    logger: logger.child({ component: "sheets-startup" })
+  });
+
+  const appendRideRow = createAppendRow({
+    sheetsClient,
+    spreadsheetId: env.googleSheetsId,
+    worksheetName: env.googleRidesWorksheetName,
+    range: env.googleRidesRange,
+    logger: logger.child({ component: "sheets-append-rides" })
+  });
+
+  const appendReviewRow = createAppendRow({
+    sheetsClient,
+    spreadsheetId: env.googleSheetsId,
+    worksheetName: env.googleNeedsReviewWorksheetName,
+    range: env.googleNeedsReviewRange,
+    logger: logger.child({ component: "sheets-append-review" })
   });
 
   const onMessage = createMessageHandler({
@@ -517,9 +642,11 @@ async function bootstrap() {
     dedupe,
     localExtractor,
     openaiNormalizer,
+    ocrExtractor,
     geocoder,
     osrmClient,
-    appendRow
+    appendRideRow,
+    appendReviewRow
   });
 
   const bootSummary = {
@@ -527,6 +654,8 @@ async function bootstrap() {
     whatsappClientId: env.whatsappClientId,
     sessionDir: sessionState.sessionPath,
     worksheetName: env.googleWorksheetName,
+    ridesWorksheetName: env.googleRidesWorksheetName,
+    needsReviewWorksheetName: env.googleNeedsReviewWorksheetName,
     geocodingProvider: env.geocodingProvider || "",
     sheetsConfigured: Boolean(sheetsClient && env.googleSheetsId),
     googleCredentialsSource: env.googleCredentialsSource,

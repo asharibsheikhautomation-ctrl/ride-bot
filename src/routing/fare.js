@@ -16,6 +16,18 @@ function normalizeMoneyString(value) {
   return text.replace(/\s+/g, " ");
 }
 
+function detectCurrencyCodeFromMoneyString(value, fallback = "") {
+  const text = normalizeMoneyString(value);
+  if (!text) return safeTrim(fallback).toUpperCase();
+
+  if (text.includes("\u00A3")) return "GBP";
+  if (text.includes("$")) return "USD";
+  if (text.includes("\u20AC") || /\beur\b/i.test(text)) return "EUR";
+  if (/\bpkr\b/i.test(text) || /\brs\.?\b/i.test(text)) return "PKR";
+
+  return safeTrim(fallback).toUpperCase();
+}
+
 function metersToKm(meters) {
   const value = toFiniteNumber(meters);
   if (value === null || value < 0) return 0;
@@ -41,17 +53,7 @@ function formatMoney(amount, currencyCode) {
   return `${symbol}${value.toFixed(2)}`;
 }
 
-/*
-Priority rule:
-1) If extracted fare exists, preserve it exactly (normalized whitespace only).
-2) Otherwise compute deterministic fare from distance and config.
-*/
-function calculateFare(distanceKm, extractedFare, cfg = {}) {
-  const preserved = normalizeMoneyString(extractedFare);
-  if (preserved) {
-    return preserved;
-  }
-
+function calculateDeterministicFare(distanceKm, cfg = {}) {
   const km = toFiniteNumber(distanceKm);
   if (km === null || km < 0) {
     return "";
@@ -72,6 +74,20 @@ function calculateFare(distanceKm, extractedFare, cfg = {}) {
 }
 
 /*
+Priority rule:
+1) If extracted fare exists, preserve it exactly (normalized whitespace only).
+2) Otherwise compute deterministic fare from distance and config.
+*/
+function calculateFare(distanceKm, extractedFare, cfg = {}) {
+  const preserved = normalizeMoneyString(extractedFare);
+  if (preserved) {
+    return preserved;
+  }
+
+  return calculateDeterministicFare(distanceKm, cfg);
+}
+
+/*
 Examples:
 calculateFare(12.5, "", { baseFare: 5, perKmRate: 2, currency: "GBP" }) -> "\u00A330.00"
 calculateFare(8, "\u00A350", { baseFare: 5, perKmRate: 2, currency: "GBP" }) -> "\u00A350"
@@ -81,6 +97,8 @@ calculateFare(metersToKm(128400), "", { baseFare: 10, perKmRate: 1.25, currency:
 module.exports = {
   metersToKm,
   normalizeMoneyString,
+  detectCurrencyCodeFromMoneyString,
+  calculateDeterministicFare,
   calculateFare
 };
 

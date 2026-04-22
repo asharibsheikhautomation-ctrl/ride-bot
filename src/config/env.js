@@ -1,3 +1,4 @@
+const os = require("node:os");
 const path = require("node:path");
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
@@ -156,7 +157,15 @@ function resolveGoogleSheetsRange() {
     process.env.GOOGLE_SHEETS_WORKSHEET_NAME || process.env.GOOGLE_WORKSHEET_NAME,
     "Sheet1"
   );
-  return `${worksheetName}!A:J`;
+  return worksheetName;
+}
+
+function resolveWorksheetRange(preferredRange, worksheetName, fallbackRange) {
+  const explicitRange = safeString(preferredRange);
+  if (explicitRange) return explicitRange;
+  const explicitWorksheet = safeString(worksheetName);
+  if (explicitWorksheet) return explicitWorksheet;
+  return safeString(fallbackRange);
 }
 
 const resolvedGoogleSheetsRange = resolveGoogleSheetsRange();
@@ -180,6 +189,24 @@ const env = Object.freeze({
   ),
   googleSheetsRange: resolvedGoogleSheetsRange,
   googleWorksheetName: resolvedGoogleWorksheetName,
+  googleRidesWorksheetName: safeString(
+    process.env.GOOGLE_SHEETS_RIDES_WORKSHEET_NAME,
+    "Rides"
+  ),
+  googleNeedsReviewWorksheetName: safeString(
+    process.env.GOOGLE_SHEETS_NEEDS_REVIEW_WORKSHEET_NAME,
+    "Needs Review"
+  ),
+  googleRidesRange: resolveWorksheetRange(
+    process.env.GOOGLE_SHEETS_RIDES_RANGE,
+    process.env.GOOGLE_SHEETS_RIDES_WORKSHEET_NAME,
+    "Rides"
+  ),
+  googleNeedsReviewRange: resolveWorksheetRange(
+    process.env.GOOGLE_SHEETS_NEEDS_REVIEW_RANGE,
+    process.env.GOOGLE_SHEETS_NEEDS_REVIEW_WORKSHEET_NAME,
+    "Needs Review"
+  ),
   googleCredentialsPath: resolveGoogleCredentialsPath(),
   googleCredentialsJson: googleCredentialsState.json,
   googleCredentialsJsonError: googleCredentialsState.error,
@@ -221,6 +248,13 @@ const env = Object.freeze({
     max: 120000
   }),
   geocodingApiKey: safeString(process.env.GEOCODING_API_KEY),
+  ocrTesseractPath: safeString(process.env.OCR_TESSERACT_PATH, "tesseract"),
+  ocrTimeoutMs: parseNumber(process.env.OCR_TIMEOUT_MS, 20000, {
+    integer: true,
+    min: 1000,
+    max: 120000
+  }),
+  ocrTempDir: resolveDataPath(process.env.OCR_TEMP_DIR, path.join(os.tmpdir(), "ride-bot-ocr")),
   puppeteerNoSandbox: parseBoolean(process.env.PUPPETEER_NO_SANDBOX, true),
   port: parseNumber(process.env.PORT, 3000, { integer: true, min: 1, max: 65535 })
 });

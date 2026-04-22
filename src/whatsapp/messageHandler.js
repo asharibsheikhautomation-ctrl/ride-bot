@@ -3,9 +3,21 @@ const { summarizeKnownError } = require("../utils/logger");
 const { generateRefer } = require("../utils/reference");
 const { createEmptyRideObject, createEmptyNormalizationObject } = require("../extraction/schemas");
 const { buildSheetRow } = require("../sheets/appendRow");
-const { calculateFare, metersToKm } = require("../routing/fare");
+const {
+  calculateDeterministicFare,
+  detectCurrencyCodeFromMoneyString,
+  metersToKm
+} = require("../routing/fare");
 
 const SYSTEM_MESSAGE_TYPES = new Set(["e2e_notification", "notification_template", "protocol"]);
+const MERGE_PROTECTED_FIELDS = new Set([
+  "distance",
+  "fare_extracted",
+  "currency",
+  "fare_type",
+  "calculated_fare",
+  "final_fare"
+]);
 
 function resolveMessageId(message) {
   return safeTrim(message?.id?._serialized || message?.id?.id || message?.id || "");
@@ -57,8 +69,9 @@ function shouldSkipMessage({ message, chat, chatId, allowFromMeMessages }) {
     return { skip: true, reason: `system message type: ${message.type}` };
   }
 
-  const body = safeTrim(message?.body || "");
-  if (!body) return { skip: true, reason: "empty body" };
+  const hasBody = Boolean(safeTrim(message?.body || ""));
+  const hasMedia = Boolean(message?.hasMedia);
+  if (!hasBody && !hasMedia) return { skip: true, reason: "empty body and no media" };
 
   return { skip: false, reason: "" };
 }
@@ -73,7 +86,7 @@ function mergeLocalAndAi(localExtracted, aiNormalized) {
     const aiValue = safeTrim(ai[key]);
     const localValue = safeTrim(local[key]);
 
-    if (key === "distance" || key === "fare") {
+    if (MERGE_PROTECTED_FIELDS.has(key)) {
       merged[key] = localValue || "";
       continue;
     }
@@ -82,6 +95,103 @@ function mergeLocalAndAi(localExtracted, aiNormalized) {
   }
 
   return merged;
+}
+
+function hasCoordinates(result) {
+  return Boolean(
+    result &&
+      Number.isFinite(Number(result.lat)) &&
+      Number.isFinite(Number(result.lng))
+  );
+}
+
+function countRideSignals(ride) {
+  const signalFields = [
+    "pickup",
+    "drop_off",
+    "required_vehicle",
+    "fare_extracted",
+    "pickup_time",
+    "pickup_date",
+    "day_label"
+  ];
+
+  return signalFields.filter((field) => Boolean(safeTrim(ride?.[field]))).length;
+}
+
+function determineReviewRouting({ ride, pickupGeocode, dropOffGeocode }) {
+  const pickupMissing = !safeTrim(ride.pickup);
+  const dropOffMissing = !safeTrim(ride.drop_off);
+  const pickupResolved = hasCoordinates(pickupGeocode);
+  const dropOffResolved = hasCoordinates(dropOffGeocode);
+  const bothGeocodesFailed =
+    !pickupResolved &&
+    !dropOffResolved &&
+    !pickupMissing &&
+    !dropOffMissing;
+  const weakSignal = countRideSignals(ride) < 2;
+
+  let parserConfidence = "0.95";
+  let status = "ready";
+  let routeTarget = "rides";
+  let reviewReason = "";
+
+  if (pickupMissing || dropOffMissing) {
+    parserConfidence = "0.25";
+    status = "needs_review";
+    routeTarget = "review";
+    reviewReason =
+      pickupMissing && dropOffMissing ? "pickup_drop_off_missing" : "pickup_or_drop_off_missing";
+  } else if (bothGeocodesFailed) {
+    parserConfidence = "0.40";
+    status = "needs_review";
+    routeTarget = "review";
+    reviewReason = "both_geocodes_failed";
+  } else if (weakSignal) {
+    parserConfidence = "0.15";
+    status = "needs_review";
+    routeTarget = "review";
+    reviewReason = "weak_parse";
+  } else if (!pickupResolved || !dropOffResolved) {
+    parserConfidence = "0.70";
+    reviewReason = "partial_geocode";
+  }
+
+  return {
+    parserConfidence,
+    status,
+    routeTarget,
+    reviewReason,
+    pickupResolved,
+    dropOffResolved,
+    bothGeocodesFailed,
+    weakSignal
+  };
+}
+
+function applyFareFieldsToRide(ride, distanceKm, env) {
+  const extractedFare = safeTrim(ride.fare_extracted);
+  const currency =
+    safeTrim(ride.currency) ||
+    detectCurrencyCodeFromMoneyString(extractedFare) ||
+    safeTrim(env?.defaultCurrency || "");
+
+  const calculatedFare = extractedFare
+    ? ""
+    : calculateDeterministicFare(distanceKm, {
+        baseFare: env?.fareBase,
+        perKmRate: env?.farePerKm,
+        currency: currency || env?.defaultCurrency
+      });
+
+  const finalFare = extractedFare || calculatedFare;
+
+  ride.fare_extracted = extractedFare;
+  ride.currency = currency;
+  ride.calculated_fare = calculatedFare;
+  ride.final_fare = finalFare;
+  ride.fare_type = extractedFare ? safeTrim(ride.fare_type) || "quoted" : finalFare ? "calculated" : "";
+  return ride;
 }
 
 function normalizeAllowedGroupIds(groupIds) {
@@ -120,7 +230,9 @@ async function safeOpenAiNormalization(openaiNormalizer, rawMessage, extracted, 
       return createEmptyNormalizationObject(
         await openaiNormalizer.normalizeWithOpenAI({
           rawMessage,
-          extracted
+          raw_message: rawMessage,
+          extracted,
+          deterministicExtraction: extracted
         })
       );
     }
@@ -148,12 +260,50 @@ async function safeOpenAiNormalization(openaiNormalizer, rawMessage, extracted, 
 }
 
 async function safeGeocode(geocoder, address, logger, field) {
-  if (!address || !geocoder) return null;
+  if (!safeTrim(address)) {
+    logger.info("Geocode skipped", {
+      stage: "geocoding",
+      field,
+      fallbackUsed: true,
+      reason: "address_missing"
+    });
+    return null;
+  }
+
+  if (!geocoder) {
+    logger.warn("Geocode skipped", {
+      stage: "geocoding",
+      field,
+      fallbackUsed: true,
+      reason: "geocoder_missing"
+    });
+    return null;
+  }
 
   try {
     const fn = geocoder.geocodeAddress || geocoder.geocode;
     if (typeof fn !== "function") return null;
-    return await fn(address);
+    const result = await fn(address);
+
+    if (result && Number.isFinite(Number(result.lat)) && Number.isFinite(Number(result.lng))) {
+      logger.info("Geocode completed", {
+        stage: "geocoding",
+        field,
+        fallbackUsed: false,
+        reason: "coordinates_resolved",
+        lat: Number(result.lat),
+        lng: Number(result.lng)
+      });
+      return result;
+    }
+
+    logger.warn("Geocode returned no coordinates", {
+      stage: "geocoding",
+      field,
+      fallbackUsed: true,
+      reason: "no_coordinates"
+    });
+    return null;
   } catch (error) {
     const summary = summarizeKnownError(error, {
       stage: "geocoding",
@@ -173,12 +323,48 @@ async function safeGeocode(geocoder, address, logger, field) {
 }
 
 async function safeRoute(osrmClient, origin, destination, logger) {
-  if (!origin || !destination || !osrmClient) return null;
+  if (!origin || !destination) {
+    logger.info("OSRM skipped", {
+      stage: "osrm_route",
+      fallbackUsed: true,
+      reason: "coordinates_missing",
+      originAvailable: Boolean(origin),
+      destinationAvailable: Boolean(destination)
+    });
+    return null;
+  }
+
+  if (!osrmClient) {
+    logger.warn("OSRM skipped", {
+      stage: "osrm_route",
+      fallbackUsed: true,
+      reason: "osrm_client_missing"
+    });
+    return null;
+  }
 
   try {
     const fn = osrmClient.getRouteFromOSRM || osrmClient.route;
     if (typeof fn !== "function") return null;
-    return await fn(origin, destination);
+    const result = await fn(origin, destination);
+
+    if (result && Number.isFinite(result.distance_meters)) {
+      logger.info("OSRM route completed", {
+        stage: "osrm_route",
+        fallbackUsed: false,
+        reason: result.distance_text || "route_resolved",
+        distanceMeters: result.distance_meters,
+        durationSeconds: result.duration_seconds || 0
+      });
+      return result;
+    }
+
+    logger.warn("OSRM returned no route", {
+      stage: "osrm_route",
+      fallbackUsed: true,
+      reason: "route_missing"
+    });
+    return null;
   } catch (error) {
     const summary = summarizeKnownError(error, {
       stage: "osrm_route",
@@ -196,7 +382,122 @@ async function safeRoute(osrmClient, origin, destination, logger) {
   }
 }
 
-function createMessageHandler({
+function hasUsefulRawText(text) {
+  const value = safeTrim(text);
+  if (!value) return false;
+  const alphaNumericCount = (value.match(/[a-z0-9]/gi) || []).length;
+  return alphaNumericCount >= 6;
+}
+
+function createReviewPayload(ride) {
+  return createEmptyRideObject({
+    source_name: ride.source_name,
+    group_name: ride.group_name,
+    raw_message: ride.raw_message,
+    message_id: ride.message_id,
+    source_group: ride.source_group,
+    received_at: ride.received_at,
+    parser_confidence: ride.parser_confidence,
+    status: ride.status
+  });
+}
+
+async function safeExtractOcrText(ocrExtractor, message, logger, context = {}) {
+  if (!message?.hasMedia || !ocrExtractor || typeof message.downloadMedia !== "function") {
+    return "";
+  }
+
+  try {
+    const media = await message.downloadMedia();
+    if (!media || !ocrExtractor.isSupportedImageMimeType(media.mimetype)) {
+      logger.debug("OCR skipped for non-image media", {
+        stage: "ocr",
+        fallbackUsed: true,
+        reason: safeTrim(media?.mimetype) || "media_missing"
+      });
+      return "";
+    }
+
+    const ocrText = normalizeText(
+      await ocrExtractor.extractTextFromMedia(media, {
+        fileStem: context.fileStem
+      })
+    );
+
+    if (!hasUsefulRawText(ocrText)) {
+      logger.info("OCR yielded no useful text", {
+        stage: "ocr",
+        fallbackUsed: true,
+        reason: safeTrim(media?.mimetype) || "image"
+      });
+      return "";
+    }
+
+    logger.info("OCR text extracted from media", {
+      stage: "ocr",
+      fallbackUsed: false,
+      reason: safePreview(ocrText)
+    });
+    return ocrText;
+  } catch (error) {
+    const summary = summarizeKnownError(error, {
+      stage: "ocr",
+      defaultSummary: "OCR extraction failed",
+      fallbackUsed: true
+    });
+
+    logger.warn(summary.summary, {
+      stage: "ocr",
+      fallbackUsed: true,
+      reason: summary.likelyCause || "Unable to OCR media attachment",
+      error
+    });
+    return "";
+  }
+}
+
+async function buildMessageAttempts({ message, messageId, normalizedBody, ocrExtractor, logger }) {
+  const attempts = [];
+  const seen = new Set();
+
+  function pushAttempt(sourceKind, rawText) {
+    const normalizedRawText = normalizeText(rawText);
+    if (!hasUsefulRawText(normalizedRawText)) return;
+
+    const fingerprint = normalizedRawText.toLowerCase();
+    if (seen.has(fingerprint)) return;
+    seen.add(fingerprint);
+
+    attempts.push({
+      sourceKind,
+      rawText: normalizedRawText,
+      attemptMessageId: sourceKind === "text" ? messageId : `${messageId}:${sourceKind}`
+    });
+  }
+
+  pushAttempt("text", normalizedBody);
+
+  const ocrText = await safeExtractOcrText(ocrExtractor, message, logger, {
+    fileStem: `${messageId || "message"}-ocr`
+  });
+  pushAttempt("ocr", ocrText);
+
+  return attempts;
+}
+
+function createAttemptDedupeKey(dedupe, attempt, message, chatId, receivedAt) {
+  return dedupe.buildDedupeKey({
+    messageId: attempt.attemptMessageId,
+    rawMessage: attempt.rawText,
+    groupId: chatId,
+    sourceKind: attempt.sourceKind,
+    timestamp: message.timestamp || receivedAt
+  });
+}
+
+async function processRideAttempt({
+  attempt,
+  message,
   env,
   logger,
   dedupe,
@@ -204,6 +505,168 @@ function createMessageHandler({
   openaiNormalizer,
   geocoder,
   osrmClient,
+  appendRideRow,
+  appendReviewRow,
+  appendRow,
+  groupName,
+  groupFilterId,
+  receivedAt,
+  chatId
+}) {
+  const attemptDedupeKey = createAttemptDedupeKey(dedupe, attempt, message, chatId, receivedAt);
+  if (dedupe.hasProcessed(attemptDedupeKey)) {
+    logger.info("Attempt skipped as duplicate", {
+      stage: "dedupe",
+      messageId: attempt.attemptMessageId,
+      chatId,
+      fallbackUsed: true,
+      reason: attempt.sourceKind
+    });
+    return { skipped: true, reason: "duplicate" };
+  }
+
+  logger.info("Processing ride attempt", {
+    stage: "ingest",
+    messageId: attempt.attemptMessageId,
+    sourceGroup: groupName,
+    chatId,
+    reason: attempt.sourceKind
+  });
+
+  const extractionContext = {
+    source_name: "whatsapp",
+    group_name: groupName,
+    source_group: groupFilterId,
+    message_id: attempt.attemptMessageId,
+    received_at: receivedAt
+  };
+
+  const localExtracted = await safeLocalExtraction(
+    localExtractor,
+    attempt.rawText,
+    extractionContext,
+    logger
+  );
+
+  const aiNormalized = await safeOpenAiNormalization(
+    openaiNormalizer,
+    attempt.rawText,
+    localExtracted,
+    logger
+  );
+
+  let ride = mergeLocalAndAi(localExtracted, aiNormalized);
+  ride.raw_message = attempt.rawText;
+  ride.source_name = safeTrim(ride.source_name) || "whatsapp";
+  ride.group_name = safeTrim(ride.group_name) || groupName;
+  ride.source_group = groupFilterId;
+  ride.message_id = attempt.attemptMessageId;
+  ride.received_at = receivedAt;
+  ride = createEmptyRideObject(ride);
+
+  if (!safeTrim(ride.refer)) {
+    ride.refer = generateRefer({
+      messageId: attempt.attemptMessageId,
+      rawMessage: attempt.rawText,
+      groupId: groupFilterId || chatId,
+      timestamp: receivedAt
+    });
+  }
+
+  const pickupGeocode = await safeGeocode(geocoder, ride.pickup, logger, "pickup");
+  const dropOffGeocode = await safeGeocode(geocoder, ride.drop_off, logger, "drop_off");
+  const route = await safeRoute(osrmClient, pickupGeocode, dropOffGeocode, logger);
+
+  let distanceKm = null;
+  if (route && Number.isFinite(route.distance_meters)) {
+    distanceKm = metersToKm(route.distance_meters);
+    ride.distance = safeTrim(route.distance_text || "");
+  } else {
+    ride.distance = "";
+    logger.warn("Route distance unavailable", {
+      stage: "osrm_route",
+      messageId: attempt.attemptMessageId,
+      refer: ride.refer,
+      fallbackUsed: true
+    });
+  }
+
+  applyFareFieldsToRide(ride, distanceKm, env);
+
+  const routingDecision = determineReviewRouting({
+    ride,
+    pickupGeocode,
+    dropOffGeocode
+  });
+  ride.parser_confidence = routingDecision.parserConfidence;
+  ride.status = routingDecision.status;
+
+  const ridePayload =
+    routingDecision.routeTarget === "review" ? createReviewPayload(ride) : createEmptyRideObject(ride);
+  const primaryAppender =
+    routingDecision.routeTarget === "review"
+      ? appendReviewRow || appendRideRow || appendRow
+      : appendRideRow || appendReviewRow || appendRow;
+
+  const finalRow = buildSheetRow(ridePayload);
+
+  logger.info("Ride routing decision computed", {
+    stage: "review_routing",
+    messageId: attempt.attemptMessageId,
+    refer: ride.refer,
+    status: ride.status,
+    parserConfidence: ride.parser_confidence,
+    routeTarget: routingDecision.routeTarget,
+    reviewReason: routingDecision.reviewReason || "ready_for_rides",
+    pickupResolved: routingDecision.pickupResolved,
+    dropOffResolved: routingDecision.dropOffResolved,
+    sourceKind: attempt.sourceKind
+  });
+
+  if (typeof primaryAppender !== "function") {
+    throw new Error("No sheet append function configured for routed ride");
+  }
+
+  await primaryAppender(ridePayload);
+
+  dedupe.markProcessed(attemptDedupeKey, {
+    messageId: attempt.attemptMessageId,
+    chatId,
+    refer: ride.refer,
+    sourceKind: attempt.sourceKind,
+    processedAt: new Date().toISOString()
+  });
+
+  logger.info("Ride attempt processed and appended successfully", {
+    stage: "completed",
+    messageId: attempt.attemptMessageId,
+    sourceGroup: groupName,
+    refer: ride.refer,
+    status: ride.status,
+    parserConfidence: ride.parser_confidence,
+    sourceKind: attempt.sourceKind,
+    row: maskRowForLog(finalRow)
+  });
+
+  return {
+    skipped: false,
+    ride,
+    ridePayload,
+    routingDecision
+  };
+}
+
+function createMessageHandler({
+  env,
+  logger,
+  dedupe,
+  localExtractor,
+  openaiNormalizer,
+  ocrExtractor,
+  geocoder,
+  osrmClient,
+  appendRideRow,
+  appendReviewRow,
   appendRow
 }) {
   const allowedGroupIds = normalizeAllowedGroupIds(env?.allowedGroups);
@@ -231,7 +694,7 @@ function createMessageHandler({
       const fallbackIncomingChatId = safeTrim(message?.from || "");
       const chatId = serializedChatId || fallbackIncomingChatId;
       const chatName = safeTrim(chat?.name || chat?.formattedTitle || "");
-      const sourceGroup = chatName || chatId;
+      const groupName = chatName || chatId;
       const receivedAt = resolveReceivedAtIso(message);
       const preview = safePreview(message?.body || "");
 
@@ -240,9 +703,10 @@ function createMessageHandler({
         messageId,
         chatId,
         chatName,
-        sourceGroup,
+        sourceGroup: groupName,
         isGroup: Boolean(chat?.isGroup),
         fromMe: Boolean(message?.fromMe),
+        hasMedia: Boolean(message?.hasMedia),
         messageType: safeTrim(message?.type || ""),
         reason: preview,
         preview
@@ -297,31 +761,22 @@ function createMessageHandler({
       logger.info("Message accepted for processing", {
         stage: "ingest_filter",
         messageId,
-        sourceGroup,
+        sourceGroup: groupName,
         chatId
       });
 
-      const rawBody = String(message.body || "");
-      const normalizedRawText = normalizeText(rawBody);
-      if (!normalizedRawText) {
-        logger.debug("Message skipped: empty after text cleanup", {
-          stage: "ingest_filter",
-          messageId,
-          chatId
-        });
-        return;
-      }
-
-      const dedupeKey = dedupe.buildDedupeKey({
+      const normalizedBody = normalizeText(String(message.body || ""));
+      const attempts = await buildMessageAttempts({
+        message,
         messageId,
-        rawMessage: normalizedRawText,
-        groupId: chatId,
-        timestamp: message.timestamp || receivedAt
+        normalizedBody,
+        ocrExtractor,
+        logger
       });
 
-      if (dedupe.hasProcessed(dedupeKey)) {
-        logger.info("Message skipped as duplicate", {
-          stage: "dedupe",
+      if (attempts.length === 0) {
+        logger.info("Message skipped: no useful text payloads found", {
+          stage: "ingest_filter",
           messageId,
           chatId,
           fallbackUsed: true
@@ -329,129 +784,44 @@ function createMessageHandler({
         return;
       }
 
-      logger.info("Message received from allowed group", {
-        stage: "ingest",
-        messageId,
-        sourceGroup,
-        chatId,
-        reason: safePreview(normalizedRawText)
-      });
+      for (const attempt of attempts) {
+        try {
+          await processRideAttempt({
+            attempt,
+            message,
+            env,
+            logger,
+            dedupe,
+            localExtractor,
+            openaiNormalizer,
+            geocoder,
+            osrmClient,
+            appendRideRow,
+            appendReviewRow,
+            appendRow,
+            groupName,
+            groupFilterId,
+            receivedAt,
+            chatId
+          });
+        } catch (error) {
+          const summary = summarizeKnownError(error, {
+            stage: "message_pipeline",
+            defaultSummary: "Ride attempt processing failed",
+            fallbackUsed: true
+          });
 
-      const extractionContext = {
-        source_group: sourceGroup,
-        message_id: messageId,
-        received_at: receivedAt
-      };
-
-      // 6) Local extraction
-      const localExtracted = await safeLocalExtraction(
-        localExtractor,
-        normalizedRawText,
-        extractionContext,
-        logger
-      );
-      logger.info("Local extraction completed", {
-        stage: "local_extraction",
-        messageId,
-        sourceGroup
-      });
-
-      // 7) OpenAI normalization
-      const aiNormalized = await safeOpenAiNormalization(
-        openaiNormalizer,
-        normalizedRawText,
-        localExtracted,
-        logger
-      );
-
-      // 8) Merge local + AI safely
-      const ride = mergeLocalAndAi(localExtracted, aiNormalized);
-      ride.raw_message = normalizedRawText;
-      ride.source_group = sourceGroup;
-      ride.message_id = messageId;
-      ride.received_at = receivedAt;
-
-      // 9) Ensure refer exists
-      if (!safeTrim(ride.refer)) {
-        ride.refer = generateRefer({
-          messageId,
-          rawMessage: normalizedRawText,
-          groupId: sourceGroup || chatId,
-          timestamp: receivedAt
-        });
+          logger.error(summary.summary, {
+            stage: "message_pipeline",
+            messageId: attempt.attemptMessageId,
+            chatId,
+            fallbackUsed: true,
+            reason: summary.likelyCause || "This ride attempt was skipped after failure",
+            error
+          });
+          return;
+        }
       }
-
-      // 10) Geocode
-      const pickupGeocode = await safeGeocode(geocoder, ride.pickup, logger, "pickup");
-      const dropOffGeocode = await safeGeocode(geocoder, ride.drop_off, logger, "drop_off");
-
-      // 11) OSRM route if both geocodes exist
-      const route = await safeRoute(osrmClient, pickupGeocode, dropOffGeocode, logger);
-
-      // 12) Set distance
-      let distanceKm = null;
-      if (route && Number.isFinite(route.distance_meters)) {
-        distanceKm = metersToKm(route.distance_meters);
-        ride.distance = safeTrim(route.distance_text || "");
-      } else {
-        ride.distance = "";
-        logger.warn("Route distance unavailable", {
-          stage: "osrm_route",
-          messageId,
-          refer: ride.refer,
-          fallbackUsed: true
-        });
-      }
-
-      // 13) Fare calculation with preservation rule
-      ride.fare = calculateFare(distanceKm, ride.fare, {
-        baseFare: env.fareBase,
-        perKmRate: env.farePerKm,
-        currency: env.defaultCurrency
-      });
-
-      // 14) Build final row
-      const finalRow = buildSheetRow(ride);
-
-      // 15) Append to sheet
-      try {
-        await appendRow(ride);
-      } catch (error) {
-        const summary = summarizeKnownError(error, {
-          stage: "sheets_append",
-          defaultSummary: "Google Sheets append failed",
-          retryExhausted: true,
-          fallbackUsed: true
-        });
-
-        logger.error(summary.summary, {
-          stage: "sheets_append",
-          messageId,
-          refer: ride.refer,
-          sourceGroup,
-          fallbackUsed: true,
-          reason: summary.likelyCause || "Row was not saved; message will retry later",
-          error
-        });
-        return;
-      }
-
-      // 16) Mark processed only after successful append
-      dedupe.markProcessed(dedupeKey, {
-        messageId,
-        chatId,
-        refer: ride.refer,
-        processedAt: new Date().toISOString()
-      });
-
-      // 17) Final status log
-      logger.info("Message processed and appended successfully", {
-        stage: "completed",
-        messageId,
-        sourceGroup,
-        refer: ride.refer,
-        row: maskRowForLog(finalRow)
-      });
     } catch (error) {
       const summary = summarizeKnownError(error, {
         stage: "message_pipeline",
@@ -472,5 +842,9 @@ function createMessageHandler({
 }
 
 module.exports = {
-  createMessageHandler
+  createMessageHandler,
+  determineReviewRouting,
+  createReviewPayload,
+  buildMessageAttempts,
+  hasUsefulRawText
 };

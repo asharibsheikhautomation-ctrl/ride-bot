@@ -1,6 +1,16 @@
 .env
-credentials.json
+
 storageState.json
 data/qr.png
 
 node_modules/
+node_modules
+.env
+credentials.json
+
+.wwebjs_auth
+.wwebjs_cache
+.cache
+
+data/.wwebjs_auth
+data/.wwebjs_cache

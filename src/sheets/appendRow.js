@@ -1,12 +1,16 @@
 const { env } = require("../config/env");
 const { createLogger, summarizeKnownError } = require("../utils/logger");
-const { SHEET_COLUMNS } = require("../extraction/schemas");
+const {
+  DEFAULT_SHEET_HEADERS,
+  buildRowFromRideObject
+} = require("../extraction/schemas");
 const { executeWithRetry } = require("../utils/retry");
 const { safeTrim } = require("../utils/text");
 
-const DEFAULT_RANGE = "Sheet1!A:J";
+const DEFAULT_RANGE = "Sheet1";
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_RETRY_DELAY_MS = 500;
+const DEFAULT_HEADER_CACHE_TTL_MS = 60 * 1000;
 const NETWORK_ERROR_CODES = new Set([
   "ECONNRESET",
   "ETIMEDOUT",
@@ -27,24 +31,8 @@ class SheetsAppendError extends Error {
   }
 }
 
-function toCell(value) {
-  if (value === null || value === undefined) return "";
-  return String(value);
-}
-
-function buildSheetRow(ride = {}) {
-  return [
-    toCell(ride.refer),
-    toCell(ride.day_date),
-    toCell(ride.starting),
-    toCell(ride.pickup),
-    toCell(ride.drop_off),
-    toCell(ride.distance),
-    toCell(ride.fare),
-    toCell(ride.required_vehicle),
-    toCell(ride.expires),
-    toCell(ride.expires_utc)
-  ];
+function buildSheetRow(ride = {}, headers = DEFAULT_SHEET_HEADERS) {
+  return buildRowFromRideObject(ride, headers);
 }
 
 function isTransientError(error) {
@@ -85,7 +73,12 @@ function buildAppendRange({ range, worksheetName }) {
   if (explicitRange) return explicitRange;
 
   const safeWorksheetName = normalizeWorksheetNameForRange(worksheetName) || "Sheet1";
-  return `${safeWorksheetName}!A:J`;
+  return safeWorksheetName;
+}
+
+function buildHeaderRange(worksheetName) {
+  const safeWorksheetName = normalizeWorksheetNameForRange(worksheetName) || "Sheet1";
+  return `${safeWorksheetName}!1:1`;
 }
 
 function extractApiErrorMessage(error) {
@@ -132,7 +125,7 @@ function classifyAppendFailure(error) {
 
   if (
     messageLower.includes("unable to parse range") ||
-    messageLower.includes("range") && messageLower.includes("not found")
+    (messageLower.includes("range") && messageLower.includes("not found"))
   ) {
     return {
       type: "worksheet_not_found",
@@ -185,7 +178,7 @@ function classifyAppendFailure(error) {
   };
 }
 
-function assertSheetPreconditions({ sheetsClient, spreadsheetId, worksheetName, range }) {
+function assertSheetPreconditions({ sheetsClient, spreadsheetId, worksheetName }) {
   if (!sheetsClient) {
     throw new SheetsAppendError("Google Sheets client is not initialized", {
       code: "SHEETS_NOT_CONFIGURED"
@@ -203,11 +196,72 @@ function assertSheetPreconditions({ sheetsClient, spreadsheetId, worksheetName, 
       code: "SHEETS_NOT_CONFIGURED"
     });
   }
+}
 
-  if (!range) {
-    throw new SheetsAppendError("Google Sheets range is missing", {
-      code: "SHEETS_NOT_CONFIGURED"
+function sanitizeHeaders(headers = []) {
+  return (Array.isArray(headers) ? headers : []).map((value, index) => {
+    const cleanValue = safeTrim(value);
+    if (cleanValue) return cleanValue;
+    return DEFAULT_SHEET_HEADERS[index] || `column_${index + 1}`;
+  });
+}
+
+async function fetchSheetHeaders({
+  sheetsClient,
+  spreadsheetId,
+  worksheetName,
+  maxAttempts,
+  retryDelayMs,
+  logger
+}) {
+  try {
+    const response = await executeWithRetry(
+      async () =>
+        sheetsClient.spreadsheets.values.get({
+          spreadsheetId,
+          range: buildHeaderRange(worksheetName),
+          majorDimension: "ROWS"
+        }),
+      {
+        maxAttempts,
+        initialDelayMs: retryDelayMs,
+        maxDelayMs: retryDelayMs * 8,
+        shouldRetry: isTransientError
+      }
+    );
+
+    const rawHeaders = Array.isArray(response?.data?.values?.[0]) ? response.data.values[0] : [];
+    const headers = sanitizeHeaders(rawHeaders);
+
+    if (headers.length === 0) {
+      logger.warn("Google Sheets header row is empty; using canonical defaults", {
+        stage: "sheets_append",
+        fallbackUsed: true,
+        reason: worksheetName
+      });
+      return [...DEFAULT_SHEET_HEADERS];
+    }
+
+    return headers;
+  } catch (error) {
+    const classification = classifyAppendFailure(error);
+    const summary = summarizeKnownError(error, {
+      stage: "sheets_append",
+      defaultSummary: "Google Sheets header lookup failed; using canonical defaults",
+      fallbackUsed: true
     });
+
+    logger.warn(summary.summary, {
+      stage: "sheets_append",
+      fallbackUsed: true,
+      status: classification.status || summary.status,
+      code: classification.errorCode || summary.code,
+      reason:
+        classification.detail || summary.likelyCause || "Unable to read worksheet header row",
+      error
+    });
+
+    return [...DEFAULT_SHEET_HEADERS];
   }
 }
 
@@ -231,6 +285,10 @@ function createAppendRow(options = {}) {
     Number.isFinite(options.retryDelayMs) && options.retryDelayMs > 0
       ? options.retryDelayMs
       : DEFAULT_RETRY_DELAY_MS;
+  const headerCacheTtlMs =
+    Number.isFinite(options.headerCacheTtlMs) && options.headerCacheTtlMs > 0
+      ? options.headerCacheTtlMs
+      : DEFAULT_HEADER_CACHE_TTL_MS;
   const logger =
     options.logger ||
     createLogger(env.logLevel || "info", {
@@ -238,14 +296,43 @@ function createAppendRow(options = {}) {
       baseMeta: { component: "sheets-append" }
     });
 
-  return async function appendRow(ride) {
-    assertSheetPreconditions({ sheetsClient, spreadsheetId, worksheetName, range });
+  let headerCache = null;
+  let headerCacheUpdatedAt = 0;
 
-    const row = buildSheetRow(ride);
-    if (row.length !== SHEET_COLUMNS.length) {
+  async function resolveHeaders(forceRefresh = false) {
+    const now = Date.now();
+    if (
+      !forceRefresh &&
+      Array.isArray(headerCache) &&
+      headerCache.length > 0 &&
+      now - headerCacheUpdatedAt < headerCacheTtlMs
+    ) {
+      return headerCache;
+    }
+
+    const headers = await fetchSheetHeaders({
+      sheetsClient,
+      spreadsheetId,
+      worksheetName,
+      maxAttempts,
+      retryDelayMs,
+      logger
+    });
+
+    headerCache = Array.isArray(headers) && headers.length > 0 ? headers : [...DEFAULT_SHEET_HEADERS];
+    headerCacheUpdatedAt = now;
+    return headerCache;
+  }
+
+  return async function appendRow(ride) {
+    assertSheetPreconditions({ sheetsClient, spreadsheetId, worksheetName });
+
+    const headers = await resolveHeaders();
+    const row = buildSheetRow(ride, headers);
+    if (row.length !== headers.length) {
       throw new SheetsAppendError("Invalid sheet row shape", {
         code: "SHEETS_ROW_INVALID",
-        details: { expected: SHEET_COLUMNS.length, received: row.length }
+        details: { expected: headers.length, received: row.length }
       });
     }
 
@@ -284,7 +371,8 @@ function createAppendRow(options = {}) {
               delayMs,
               status: classification.status || summary.status,
               code: classification.errorCode || summary.code,
-              reason: classification.detail || summary.likelyCause || "Temporary API/network issue",
+              reason:
+                classification.detail || summary.likelyCause || "Temporary API/network issue",
               error
             });
           }
@@ -300,7 +388,8 @@ function createAppendRow(options = {}) {
 
       return {
         updatedRange: response?.data?.updates?.updatedRange || "",
-        updatedRows: response?.data?.updates?.updatedRows || 0
+        updatedRows: response?.data?.updates?.updatedRows || 0,
+        headers
       };
     } catch (error) {
       const attempts = Number(error?.attempts) || maxAttempts;
@@ -330,7 +419,8 @@ function createAppendRow(options = {}) {
         details: {
           range: range || DEFAULT_RANGE,
           worksheetName: worksheetName || "",
-          columns: SHEET_COLUMNS.length,
+          columns: headers.length,
+          headers,
           failureType: classification.type || "unknown",
           providerMessage: classification.apiMessage || ""
         }
@@ -342,6 +432,8 @@ function createAppendRow(options = {}) {
 module.exports = {
   createAppendRow,
   buildSheetRow,
+  fetchSheetHeaders,
+  buildHeaderRange,
   SheetsAppendError,
   classifyAppendFailure,
   buildAppendRange

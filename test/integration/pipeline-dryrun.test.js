@@ -50,9 +50,9 @@ test("end-to-end message pipeline with mocks maps final row and dedupes", async 
         duration_text: "20m"
       })
     },
-    appendRow: async (ride) => {
+    appendRideRow: async (ride) => {
       appendCalls.push(ride);
-      return { updatedRange: "Sheet1!A2:J2", updatedRows: 1 };
+      return { updatedRange: "Rides!A2", updatedRows: 1 };
     }
   });
 
@@ -73,7 +73,8 @@ test("end-to-end message pipeline with mocks maps final row and dedupes", async 
   await handler(message);
   assert.equal(appendCalls.length, 1);
   assert.equal(appendCalls[0].distance, "10.0 km");
-  assert.equal(appendCalls[0].fare, "\u00A350");
+  assert.equal(appendCalls[0].fare_extracted, "\u00A350");
+  assert.equal(appendCalls[0].final_fare, "\u00A350");
 
   // Same message should be skipped by dedupe after successful append.
   await handler(message);

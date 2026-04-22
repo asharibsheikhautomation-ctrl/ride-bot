@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const puppeteer = require("puppeteer");
 const { Client, LocalAuth } = require("whatsapp-web.js");
 const qrImage = require("qrcode");
 const terminalQr = require("qrcode-terminal");
@@ -47,6 +48,39 @@ function sanitizeFileSegment(value) {
 function isHeadlessEnabled(headlessValue) {
   if (headlessValue === false) return false;
   return true;
+}
+
+function resolveBrowserExecutablePath(customPath = "") {
+  const explicitPath = safeTrim(customPath);
+  if (explicitPath && fs.existsSync(explicitPath)) {
+    return explicitPath;
+  }
+
+  try {
+    const bundledPath = safeTrim(puppeteer.executablePath());
+    if (bundledPath && fs.existsSync(bundledPath)) {
+      return bundledPath;
+    }
+  } catch (error) {
+    // Ignore bundled browser resolution failures and try system browsers next.
+  }
+
+  if (process.platform === "win32") {
+    const windowsCandidates = [
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+      "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+    ];
+
+    for (const candidate of windowsCandidates) {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  return "";
 }
 
 function resolveTerminalQrRenderer(customRenderer) {
@@ -204,7 +238,17 @@ function buildStartupTimeoutHint({ tracker, persistedSessionDetected }) {
   return "No valid session became ready in time; check browser runtime and WhatsApp linked device status.";
 }
 
-function createDefaultClient({ sessionPath, clientId, puppeteerOptions }) {
+function createDefaultClient({ sessionPath, clientId, puppeteerOptions, logger }) {
+  const executablePath = resolveBrowserExecutablePath(puppeteerOptions?.executablePath);
+
+  if (logger) {
+    logger.info("WhatsApp browser executable selected", {
+      stage: "whatsapp_connect",
+      fallbackUsed: false,
+      reason: executablePath || "default puppeteer resolution"
+    });
+  }
+
   return new Client({
     authStrategy: new LocalAuth({
       clientId,
@@ -212,7 +256,8 @@ function createDefaultClient({ sessionPath, clientId, puppeteerOptions }) {
     }),
     puppeteer: {
       headless: true,
-      ...(puppeteerOptions || {})
+      ...(puppeteerOptions || {}),
+      ...(executablePath ? { executablePath } : {})
     }
   });
 }
@@ -641,7 +686,8 @@ async function initializeWhatsAppClient(options = {}) {
           createDefaultClient({
             sessionPath,
             clientId,
-            puppeteerOptions: options.puppeteer
+            puppeteerOptions: options.puppeteer,
+            logger
           });
 
   let client;

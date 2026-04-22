@@ -11,9 +11,22 @@ const { createLocalExtractor } = require("./extraction/localExtractor");
 const { createOpenAiNormalizer } = require("./extraction/openaiNormalizer");
 const { createGeocoder } = require("./routing/geocode");
 const { createOsrmClient } = require("./routing/osrm");
-const { metersToKm, calculateFare } = require("./routing/fare");
+const {
+  metersToKm,
+  calculateDeterministicFare,
+  detectCurrencyCodeFromMoneyString
+} = require("./routing/fare");
 const { createSheetsClient } = require("./sheets/sheetsClient");
 const { createAppendRow, buildSheetRow } = require("./sheets/appendRow");
+
+const MERGE_PROTECTED_FIELDS = new Set([
+  "distance",
+  "fare_extracted",
+  "currency",
+  "fare_type",
+  "calculated_fare",
+  "final_fare"
+]);
 
 const SAMPLE_DRY_RUN_MESSAGE = `Saloon Car (1 Persons)
 
@@ -199,7 +212,7 @@ function mergeLocalAndAi(localExtracted, aiNormalized) {
     const aiValue = safeTrim(ai[key]);
     const localValue = safeTrim(local[key]);
 
-    if (key === "distance" || key === "fare") {
+    if (MERGE_PROTECTED_FIELDS.has(key)) {
       merged[key] = localValue || "";
       continue;
     }
@@ -210,15 +223,140 @@ function mergeLocalAndAi(localExtracted, aiNormalized) {
   return merged;
 }
 
+function applyFareFieldsToRide(ride, distanceKm, env) {
+  const extractedFare = safeTrim(ride.fare_extracted);
+  const currency =
+    safeTrim(ride.currency) ||
+    detectCurrencyCodeFromMoneyString(extractedFare) ||
+    safeTrim(env?.defaultCurrency || "");
+
+  const calculatedFare = extractedFare
+    ? ""
+    : calculateDeterministicFare(distanceKm, {
+        baseFare: env?.fareBase,
+        perKmRate: env?.farePerKm,
+        currency: currency || env?.defaultCurrency
+      });
+
+  const finalFare = extractedFare || calculatedFare;
+
+  ride.fare_extracted = extractedFare;
+  ride.currency = currency;
+  ride.calculated_fare = calculatedFare;
+  ride.final_fare = finalFare;
+  ride.fare_type = extractedFare ? "quoted" : finalFare ? "calculated" : "";
+  return ride;
+}
+
+function hasCoordinates(result) {
+  return Boolean(
+    result &&
+      Number.isFinite(Number(result.lat)) &&
+      Number.isFinite(Number(result.lng))
+  );
+}
+
+function determineReviewRouting({ ride, pickupGeocode, dropOffGeocode }) {
+  const pickupMissing = !safeTrim(ride.pickup);
+  const dropOffMissing = !safeTrim(ride.drop_off);
+  const pickupResolved = hasCoordinates(pickupGeocode);
+  const dropOffResolved = hasCoordinates(dropOffGeocode);
+  const bothGeocodesFailed =
+    !pickupResolved &&
+    !dropOffResolved &&
+    !pickupMissing &&
+    !dropOffMissing;
+
+  let parserConfidence = "0.95";
+  let status = "ready";
+  let routeTarget = "rides";
+  let reviewReason = "";
+
+  if (pickupMissing || dropOffMissing) {
+    parserConfidence = "0.25";
+    status = "needs_review";
+    routeTarget = "review";
+    reviewReason = pickupMissing && dropOffMissing ? "pickup_drop_off_missing" : "pickup_or_drop_off_missing";
+  } else if (bothGeocodesFailed) {
+    parserConfidence = "0.40";
+    status = "needs_review";
+    routeTarget = "review";
+    reviewReason = "both_geocodes_failed";
+  } else if (!pickupResolved || !dropOffResolved) {
+    parserConfidence = "0.70";
+    reviewReason = "partial_geocode";
+  }
+
+  return {
+    parserConfidence,
+    status,
+    routeTarget,
+    reviewReason,
+    pickupResolved,
+    dropOffResolved
+  };
+}
+
+function createReviewPayload(ride) {
+  return createEmptyRideObject({
+    source_name: ride.source_name,
+    group_name: ride.group_name,
+    raw_message: ride.raw_message,
+    message_id: ride.message_id,
+    source_group: ride.source_group,
+    received_at: ride.received_at,
+    parser_confidence: ride.parser_confidence,
+    status: ride.status
+  });
+}
+
 async function safeGeocode(geocoder, address, field, logger) {
   try {
-    if (!safeTrim(address)) return null;
+    if (!safeTrim(address)) {
+      logger.info("Dry-run geocode skipped", {
+        stage: "geocoding",
+        field,
+        fallbackUsed: true,
+        reason: "address_missing"
+      });
+      return null;
+    }
     const fn = geocoder?.geocodeAddress || geocoder?.geocode;
-    if (typeof fn !== "function") return null;
-    return await fn(address);
+    if (typeof fn !== "function") {
+      logger.warn("Dry-run geocode skipped", {
+        stage: "geocoding",
+        field,
+        fallbackUsed: true,
+        reason: "geocoder_missing"
+      });
+      return null;
+    }
+    const result = await fn(address);
+    if (result && Number.isFinite(Number(result.lat)) && Number.isFinite(Number(result.lng))) {
+      logger.info("Dry-run geocode completed", {
+        stage: "geocoding",
+        field,
+        fallbackUsed: false,
+        reason: "coordinates_resolved",
+        lat: Number(result.lat),
+        lng: Number(result.lng)
+      });
+      return result;
+    }
+
+    logger.warn("Dry-run geocode returned no coordinates", {
+      stage: "geocoding",
+      field,
+      fallbackUsed: true,
+      reason: "no_coordinates"
+    });
+    return null;
   } catch (error) {
     logger.warn("Dry-run geocoding failed", {
+      stage: "geocoding",
       field,
+      fallbackUsed: true,
+      reason: "request_failed",
       error: error?.message || String(error)
     });
     return null;
@@ -228,10 +366,47 @@ async function safeGeocode(geocoder, address, field, logger) {
 async function safeRoute(osrmClient, origin, destination, logger) {
   try {
     const fn = osrmClient?.getRouteFromOSRM || osrmClient?.route;
-    if (!origin || !destination || typeof fn !== "function") return null;
-    return await fn(origin, destination);
+    if (!origin || !destination) {
+      logger.info("Dry-run OSRM skipped", {
+        stage: "osrm_route",
+        fallbackUsed: true,
+        reason: "coordinates_missing",
+        originAvailable: Boolean(origin),
+        destinationAvailable: Boolean(destination)
+      });
+      return null;
+    }
+    if (typeof fn !== "function") {
+      logger.warn("Dry-run OSRM skipped", {
+        stage: "osrm_route",
+        fallbackUsed: true,
+        reason: "osrm_client_missing"
+      });
+      return null;
+    }
+    const result = await fn(origin, destination);
+    if (result && Number.isFinite(result.distance_meters)) {
+      logger.info("Dry-run OSRM completed", {
+        stage: "osrm_route",
+        fallbackUsed: false,
+        reason: result.distance_text || "route_resolved",
+        distanceMeters: result.distance_meters,
+        durationSeconds: result.duration_seconds || 0
+      });
+      return result;
+    }
+
+    logger.warn("Dry-run OSRM returned no route", {
+      stage: "osrm_route",
+      fallbackUsed: true,
+      reason: "route_missing"
+    });
+    return null;
   } catch (error) {
     logger.warn("Dry-run OSRM route failed", {
+      stage: "osrm_route",
+      fallbackUsed: true,
+      reason: "request_failed",
       error: error?.message || String(error)
     });
     return null;
@@ -279,6 +454,8 @@ async function runDryRun(options = {}) {
   });
 
   const context = {
+    source_name: "whatsapp",
+    group_name: sourceGroup,
     source_group: sourceGroup,
     message_id: messageId,
     received_at: receivedAt
@@ -298,7 +475,9 @@ async function runDryRun(options = {}) {
     aiNormalized = createEmptyNormalizationObject(
       await openaiNormalizer.normalizeWithOpenAI({
         rawMessage: normalizedRawText,
-        extracted: localExtracted
+        raw_message: normalizedRawText,
+        extracted: localExtracted,
+        deterministicExtraction: localExtracted
       })
     );
   } catch (error) {
@@ -307,11 +486,14 @@ async function runDryRun(options = {}) {
     });
   }
 
-  const ride = mergeLocalAndAi(localExtracted, aiNormalized);
+  let ride = mergeLocalAndAi(localExtracted, aiNormalized);
   ride.raw_message = normalizedRawText;
+  ride.source_name = safeTrim(ride.source_name) || "whatsapp";
+  ride.group_name = safeTrim(ride.group_name) || sourceGroup;
   ride.source_group = sourceGroup;
   ride.message_id = messageId;
   ride.received_at = receivedAt;
+  ride = createEmptyRideObject(ride);
 
   if (!safeTrim(ride.refer)) {
     ride.refer = generateRefer({
@@ -343,13 +525,17 @@ async function runDryRun(options = {}) {
     ride.distance = "";
   }
 
-  ride.fare = calculateFare(distanceKm, ride.fare, {
-    baseFare: env.fareBase,
-    perKmRate: env.farePerKm,
-    currency: env.defaultCurrency
+  applyFareFieldsToRide(ride, distanceKm, env);
+  const routingDecision = determineReviewRouting({
+    ride,
+    pickupGeocode,
+    dropOffGeocode
   });
-
-  const finalRow = buildSheetRow(ride);
+  ride.parser_confidence = routingDecision.parserConfidence;
+  ride.status = routingDecision.status;
+  const ridePayload =
+    routingDecision.routeTarget === "review" ? createReviewPayload(ride) : createEmptyRideObject(ride);
+  const finalRow = buildSheetRow(ridePayload);
   const appendOutcome = {
     enabled: Boolean(resolvedOptions.appendSheet),
     attempted: false,
@@ -370,15 +556,26 @@ async function runDryRun(options = {}) {
         logger: logger.child({ component: "sheets-client" })
       });
 
-      const appendRow = createAppendRow({
+      const appendRideRow = createAppendRow({
         sheetsClient,
         spreadsheetId: env.googleSheetsId,
-        worksheetName: env.googleWorksheetName,
-        range: env.googleSheetsRange,
-        logger: logger.child({ component: "sheets-append" })
+        worksheetName: env.googleRidesWorksheetName,
+        range: env.googleRidesRange,
+        logger: logger.child({ component: "sheets-append-rides" })
       });
 
-      const appendResult = await appendRow(ride);
+      const appendReviewRow = createAppendRow({
+        sheetsClient,
+        spreadsheetId: env.googleSheetsId,
+        worksheetName: env.googleNeedsReviewWorksheetName,
+        range: env.googleNeedsReviewRange,
+        logger: logger.child({ component: "sheets-append-review" })
+      });
+
+      const appendResult =
+        routingDecision.routeTarget === "review"
+          ? await appendReviewRow(ridePayload)
+          : await appendRideRow(ridePayload);
       appendOutcome.success = true;
       appendOutcome.result = appendResult;
     } catch (error) {
@@ -412,7 +609,9 @@ async function runDryRun(options = {}) {
       drop_off: dropOffGeocode
     },
     osrm_route: route,
+    routing: routingDecision,
     final_ride: createEmptyRideObject(ride),
+    final_sheet_payload: ridePayload,
     final_row: finalRow,
     sheets_append: appendOutcome
   };
