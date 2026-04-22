@@ -239,13 +239,11 @@ function buildStartupTimeoutHint({ tracker, persistedSessionDetected }) {
 }
 
 function createDefaultClient({ sessionPath, clientId, puppeteerOptions, logger }) {
-  const executablePath = resolveBrowserExecutablePath(puppeteerOptions?.executablePath);
-
   if (logger) {
     logger.info("WhatsApp browser executable selected", {
       stage: "whatsapp_connect",
       fallbackUsed: false,
-      reason: executablePath || "default puppeteer resolution"
+      reason: safeTrim(puppeteerOptions?.executablePath) || "default puppeteer resolution"
     });
   }
 
@@ -254,10 +252,10 @@ function createDefaultClient({ sessionPath, clientId, puppeteerOptions, logger }
       clientId,
       dataPath: sessionPath
     }),
+    // Only pass executablePath when explicitly supplied in puppeteerOptions/config later.
     puppeteer: {
       headless: true,
-      ...(puppeteerOptions || {}),
-      ...(executablePath ? { executablePath } : {})
+      ...(puppeteerOptions || {})
     }
   });
 }
