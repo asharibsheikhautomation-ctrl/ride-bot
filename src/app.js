@@ -223,17 +223,29 @@ function startupHealthSnapshot() {
 
 function resolvePuppeteerOptions() {
   if (env.nodeEnv !== "production") {
-    return {};
+    return env.puppeteerExecutablePath
+      ? {
+          executablePath: env.puppeteerExecutablePath
+        }
+      : {};
   }
 
   if (process.platform === "win32") {
-    return {
-      headless: true
-    };
+    return env.puppeteerExecutablePath
+      ? {
+          headless: true,
+          executablePath: env.puppeteerExecutablePath
+        }
+      : {
+          headless: true
+        };
   }
 
   return {
     headless: true,
+    ...(env.puppeteerExecutablePath
+      ? { executablePath: env.puppeteerExecutablePath }
+      : {}),
     args: RAILWAY_PUPPETEER_ARGS
   };
 }

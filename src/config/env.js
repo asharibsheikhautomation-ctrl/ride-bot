@@ -255,6 +255,7 @@ const env = Object.freeze({
     max: 120000
   }),
   ocrTempDir: resolveDataPath(process.env.OCR_TEMP_DIR, path.join(os.tmpdir(), "ride-bot-ocr")),
+  puppeteerExecutablePath: safeString(process.env.PUPPETEER_EXECUTABLE_PATH),
   puppeteerNoSandbox: parseBoolean(process.env.PUPPETEER_NO_SANDBOX, true),
   port: parseNumber(process.env.PORT, 3000, { integer: true, min: 1, max: 65535 })
 });
