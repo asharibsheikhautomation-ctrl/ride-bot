@@ -7,8 +7,13 @@ const { validateSheetsConfig } = require("../../src/sheets/sheetsClient");
 const {
   classifyAppendFailure,
   buildAppendRange,
-  buildSheetRow
+  buildSheetRow,
+  fetchSheetHeaders
 } = require("../../src/sheets/appendRow");
+const {
+  buildSheetRowObject,
+  cleanDropOffForSheet
+} = require("../../src/extraction/schemas");
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "ride-bot-sheets-test-"));
@@ -94,70 +99,182 @@ test("buildAppendRange uses quoted worksheet names safely", () => {
   assert.equal(range, "'Ride Sheet'");
 });
 
-test("buildSheetRow maps canonical headers by name", () => {
-  const row = buildSheetRow(
-    {
-      refer: "RID-20260415-AB12",
-      source_name: "whatsapp",
-      group_name: "Dispatch Group",
-      pickup_date: "7th October 2025",
-      pickup_time: "20:05 pm",
-      final_fare: "\u00A350",
-      special_notes: "Flight: VY6652"
-    },
-    ["refer", "group_name", "pickup_date", "pickup_time", "final_fare", "special_notes"]
-  );
+test("buildSheetRow maps strict 11-column schema in exact order", () => {
+  const row = buildSheetRow({
+    refer: "RID-20260415-AB12",
+    group_name: "Dispatch Group",
+    source_name: "447700900123",
+    source_time: "10:15:00 am",
+    pickup_day_date: "Tuesday 7th October 2025",
+    starting_timing: "20:05 pm",
+    pickup: "Heathrow Airport, Terminal 4",
+    drop_off: "12 Woodlands Close",
+    distance: "10",
+    fare: "1200.00",
+    required_vehicle: "Estate",
+    payment_status: "cash"
+  });
 
   assert.deepEqual(row, [
     "RID-20260415-AB12",
     "Dispatch Group",
-    "7th October 2025",
-    "20:05 pm",
-    "\u00A350",
-    "Flight: VY6652"
-  ]);
-});
-
-test("buildSheetRow keeps legacy 10-column headers working via header mapping", () => {
-  const row = buildSheetRow(
-    {
-      refer: "RID-20260415-AB12",
-      day_label: "Tuesday",
-      pickup_date: "7th October 2025",
-      pickup_time: "20:05 pm",
-      pickup: "Heathrow Airport, Terminal 4",
-      drop_off: "12 Woodlands Close",
-      distance: "10.0 km",
-      final_fare: "\u00A350",
-      required_vehicle: "Saloon Car",
-      expiry: "",
-      expiry_utc: ""
-    },
-    [
-      "Refer",
-      "Day & Date",
-      "Starting",
-      "Pickup",
-      "Drop Off",
-      "Distance",
-      "Fare",
-      "Required Vehicle",
-      "Expires",
-      "Expires UTC"
-    ]
-  );
-
-  assert.deepEqual(row, [
-    "RID-20260415-AB12",
+    "447700900123",
+    "10:15:00 am",
     "Tuesday 7th October 2025",
     "20:05 pm",
     "Heathrow Airport, Terminal 4",
     "12 Woodlands Close",
-    "10.0 km",
-    "\u00A350",
-    "Saloon Car",
-    "",
-    ""
+    "10",
+    "1200.00",
+    "Estate",
+    "cash"
+  ]);
+});
+
+test("buildSheetRow maps values by fetched header names instead of fixed positions", () => {
+  const row = buildSheetRow(
+    {
+      refer: "RID-20260415-AB12",
+      group_name: "Dispatch Group",
+      source_name: "447700900123",
+      source_time: "10:15:00 am",
+      pickup_day_date: "Tuesday 7th October 2025",
+      starting_timing: "20:05 pm",
+      pickup: "Heathrow Airport, Terminal 4",
+      drop_off: "12 Woodlands Close",
+      distance: "10",
+      fare: "1200.00",
+      required_vehicle: "Estate",
+      payment_status: "cash"
+    },
+    [
+      "Pickup",
+      "Refer",
+      "Source Time",
+      "Distance",
+      "Required Vehicle",
+      "Source Name",
+      "Payment Status"
+    ]
+  );
+
+  assert.deepEqual(row, [
+    "Heathrow Airport, Terminal 4",
+    "RID-20260415-AB12",
+    "10:15:00 am",
+    "10",
+    "Estate",
+    "447700900123",
+    "cash"
+  ]);
+});
+
+test("buildSheetRow keeps blank strings for missing strict fields", () => {
+  const row = buildSheetRow({
+    refer: "RID-20260415-AB12",
+    pickup: "STN"
+  });
+
+  assert.equal(row.length, 12);
+  assert.equal(row[0], "RID-20260415-AB12");
+  assert.equal(row[6], "STN");
+  assert.equal(row[11], "");
+});
+
+test("buildSheetRowObject maps exact sheet headers to ride fields and aliases", () => {
+  const rowObject = buildSheetRowObject({
+    refer: "RID-20260415-AB12",
+    group_name: "testing",
+    source_name: "Hafiz Ashari",
+    source_time: "09:30:45 am",
+    pickup_date: "Tuesday 7th October 2025",
+    pickup_time: "20:05 pm",
+    pickup: "Heathrow Airport",
+    drop_off: "12, Woodlands Close",
+    distance: "98",
+    fare: "2500.00",
+    vehicle: "Saloon Car",
+    payment_status: "cash"
+  });
+
+  assert.deepEqual(rowObject, {
+    Refer: "RID-20260415-AB12",
+    "Group Name": "testing",
+    "Source Name": "Hafiz Ashari",
+    "Source Time": "09:30:45 am",
+    "Pickup Day & Date": "Tuesday 7th October 2025",
+    "Starting Timing": "20:05 pm",
+    Pickup: "Heathrow Airport",
+    "Drop Off": "12, Woodlands Close",
+    Distance: "98",
+    Fare: "2500.00",
+    "Required Vehicle": "Saloon Car",
+    "Payment Status": "cash"
+  });
+});
+
+test("cleanDropOffForSheet removes vehicle noise from drop address", () => {
+  assert.equal(
+    cleanDropOffForSheet("12, Woodlands Close\nSaloon Car", {
+      required_vehicle: "Saloon Car"
+    }),
+    "12, Woodlands Close"
+  );
+
+  assert.equal(
+    cleanDropOffForSheet("12, Woodlands Close - Saloon Car", {
+      required_vehicle: "Saloon Car"
+    }),
+    "12, Woodlands Close"
+  );
+});
+
+test("fetchSheetHeaders returns sanitized live headers", async () => {
+  const headers = await fetchSheetHeaders({
+    sheetsClient: {
+      spreadsheets: {
+        values: {
+          get: async () => ({
+            data: {
+              values: [[
+                "Refer",
+                "Group Name",
+                "Source Name",
+                "Source Time",
+                "Pickup Day & Date",
+                "Starting Timing",
+                "Pickup",
+                "Drop Off",
+                "Distance",
+                "Fare",
+                "Required Vehicle",
+                "Payment Status"
+              ]]
+            }
+          })
+        }
+      }
+    },
+    spreadsheetId: "sheet-id",
+    worksheetName: "Rides",
+    maxAttempts: 1,
+    retryDelayMs: 1,
+    logger: { warn: () => {} }
+  });
+
+  assert.deepEqual(headers, [
+    "Refer",
+    "Group Name",
+    "Source Name",
+    "Source Time",
+    "Pickup Day & Date",
+    "Starting Timing",
+    "Pickup",
+    "Drop Off",
+    "Distance",
+    "Fare",
+    "Required Vehicle",
+    "Payment Status"
   ]);
 });
 

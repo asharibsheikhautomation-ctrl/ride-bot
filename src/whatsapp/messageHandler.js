@@ -1,23 +1,16 @@
 const { normalizeText, safeTrim } = require("../utils/text");
 const { summarizeKnownError } = require("../utils/logger");
 const { generateRefer } = require("../utils/reference");
-const { createEmptyRideObject, createEmptyNormalizationObject } = require("../extraction/schemas");
-const { buildSheetRow } = require("../sheets/appendRow");
 const {
-  calculateDeterministicFare,
-  detectCurrencyCodeFromMoneyString,
-  metersToKm
-} = require("../routing/fare");
+  createEmptyRideObject,
+  createEmptyNormalizationObject,
+  buildSheetRowObject
+} = require("../extraction/schemas");
+const { buildSheetRow } = require("../sheets/appendRow");
+const { calculateDeterministicFare, metersToKm } = require("../routing/fare");
 
 const SYSTEM_MESSAGE_TYPES = new Set(["e2e_notification", "notification_template", "protocol"]);
-const MERGE_PROTECTED_FIELDS = new Set([
-  "distance",
-  "fare_extracted",
-  "currency",
-  "fare_type",
-  "calculated_fare",
-  "final_fare"
-]);
+const MERGE_PROTECTED_FIELDS = new Set(["distance", "fare"]);
 
 function resolveMessageId(message) {
   return safeTrim(message?.id?._serialized || message?.id?.id || message?.id || "");
@@ -31,21 +24,44 @@ function resolveReceivedAtIso(message) {
   return new Date().toISOString();
 }
 
-function maskPhoneNumbers(value) {
-  const text = String(value || "");
-  return text.replace(/(\+?\d[\d\s().-]{6,}\d)/g, (match) => {
-    const digits = match.replace(/\D/g, "");
-    if (digits.length <= 2) return "***";
-    return `***${digits.slice(-2)}`;
-  });
+function formatSourceTime(receivedAt, timeZone = "Europe/London") {
+  const date = new Date(receivedAt);
+  if (Number.isNaN(date.getTime())) return "";
+
+  return new Intl.DateTimeFormat("en-GB", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+    timeZone
+  }).format(date);
 }
 
-function safePreview(text, length = 180) {
-  return maskPhoneNumbers(String(text || "").slice(0, length));
+function normalizeWhatsappIdentity(value) {
+  return safeTrim(String(value || "").replace(/@.+$/, ""));
 }
 
-function maskRowForLog(row) {
-  return row.map((cell) => maskPhoneNumbers(cell));
+async function resolveSourceName(message) {
+  const notifyName = safeTrim(message?._data?.notifyName || message?.notifyName || "");
+  if (notifyName) return notifyName;
+
+  if (typeof message?.getContact === "function") {
+    try {
+      const contact = await message.getContact();
+      const contactName = safeTrim(
+        contact?.pushname || contact?.name || contact?.shortName || contact?.number
+      );
+      if (contactName) return contactName;
+    } catch (error) {
+      // Fall back to raw WhatsApp identifiers below.
+    }
+  }
+
+  return (
+    normalizeWhatsappIdentity(message?.author) ||
+    normalizeWhatsappIdentity(message?.from) ||
+    ""
+  );
 }
 
 function isBroadcastLike(message, chatId) {
@@ -81,8 +97,7 @@ function mergeLocalAndAi(localExtracted, aiNormalized) {
   const ai = createEmptyNormalizationObject(aiNormalized || {});
   const merged = createEmptyRideObject(local);
 
-  const keys = Object.keys(ai);
-  for (const key of keys) {
+  for (const key of Object.keys(ai)) {
     const aiValue = safeTrim(ai[key]);
     const localValue = safeTrim(local[key]);
 
@@ -105,93 +120,71 @@ function hasCoordinates(result) {
   );
 }
 
-function countRideSignals(ride) {
-  const signalFields = [
-    "pickup",
-    "drop_off",
-    "required_vehicle",
-    "fare_extracted",
-    "pickup_time",
-    "pickup_date",
-    "day_label"
-  ];
+function applyFareFieldsToRide(ride, distanceKm, env) {
+  if (safeTrim(ride.fare)) {
+    return ride;
+  }
 
-  return signalFields.filter((field) => Boolean(safeTrim(ride?.[field]))).length;
+  ride.fare = calculateDeterministicFare(distanceKm, {
+    baseFare: env?.fareBase,
+    perKmRate: env?.farePerKm,
+    currency: env?.defaultCurrency,
+    requiredVehicle: ride.required_vehicle
+  });
+  return ride;
 }
 
-function determineReviewRouting({ ride, pickupGeocode, dropOffGeocode }) {
-  const pickupMissing = !safeTrim(ride.pickup);
-  const dropOffMissing = !safeTrim(ride.drop_off);
-  const pickupResolved = hasCoordinates(pickupGeocode);
-  const dropOffResolved = hasCoordinates(dropOffGeocode);
-  const bothGeocodesFailed =
-    !pickupResolved &&
-    !dropOffResolved &&
-    !pickupMissing &&
-    !dropOffMissing;
-  const weakSignal = countRideSignals(ride) < 2;
+function formatDistanceMiles(distanceMeters) {
+  const numeric = Number(distanceMeters);
+  if (!Number.isFinite(numeric) || numeric < 0) return "";
+  return String(Math.round(numeric / 1609.344));
+}
 
-  let parserConfidence = "0.95";
-  let status = "ready";
-  let routeTarget = "rides";
-  let reviewReason = "";
+function isContaminatedLocationValue(value) {
+  const text = safeTrim(value).toLowerCase();
+  if (!text) return false;
+  return /\b(?:same(?:-|\s)day\s+payment|cash|card|account|invoice|paid|prepaid|pending|unpaid|flight(?:\s+number)?|arriving\s+from|job\s*alert|price|fare|cost|net\s+fare|net\s+amount|required\s+vehicle|vehicle)\b/.test(text) ||
+    /\btime\s*:/i.test(text);
+}
 
-  if (pickupMissing || dropOffMissing) {
-    parserConfidence = "0.25";
-    status = "needs_review";
-    routeTarget = "review";
-    reviewReason =
-      pickupMissing && dropOffMissing ? "pickup_drop_off_missing" : "pickup_or_drop_off_missing";
-  } else if (bothGeocodesFailed) {
-    parserConfidence = "0.40";
-    status = "needs_review";
-    routeTarget = "review";
-    reviewReason = "both_geocodes_failed";
-  } else if (weakSignal) {
-    parserConfidence = "0.15";
-    status = "needs_review";
-    routeTarget = "review";
-    reviewReason = "weak_parse";
-  } else if (!pickupResolved || !dropOffResolved) {
-    parserConfidence = "0.70";
-    reviewReason = "partial_geocode";
+function determineRoutingDecision({
+  ride,
+  analysis,
+  pickupGeocode,
+  dropOffGeocode
+}) {
+  const reasons = [];
+  const selectedPickup = analysis?.selected?.pickup;
+  const selectedDropOff = analysis?.selected?.drop_off;
+  const selectedVehicle = analysis?.selected?.required_vehicle;
+
+  if (!safeTrim(ride.pickup)) reasons.push("pickup_missing");
+  if (!safeTrim(ride.drop_off)) reasons.push("drop_off_missing");
+  if (selectedPickup?.contaminated || selectedDropOff?.contaminated) {
+    reasons.push("route_contaminated");
+  }
+  if (isContaminatedLocationValue(ride.pickup) || isContaminatedLocationValue(ride.drop_off)) {
+    reasons.push("route_contaminated");
+  }
+  if ((analysis?.hadDateLikeText && !ride.pickup_day_date) || (analysis?.hadTimeLikeText && !ride.starting_timing)) {
+    reasons.push("schedule_unresolved");
+  }
+  if (selectedVehicle?.source === "weak") {
+    reasons.push("vehicle_weak");
+  }
+  if (
+    safeTrim(ride.pickup) &&
+    safeTrim(ride.drop_off) &&
+    !hasCoordinates(pickupGeocode) &&
+    !hasCoordinates(dropOffGeocode)
+  ) {
+    reasons.push("both_geocodes_failed");
   }
 
   return {
-    parserConfidence,
-    status,
-    routeTarget,
-    reviewReason,
-    pickupResolved,
-    dropOffResolved,
-    bothGeocodesFailed,
-    weakSignal
+    target: reasons.length > 0 ? "review" : "rides",
+    reasons: [...new Set(reasons)]
   };
-}
-
-function applyFareFieldsToRide(ride, distanceKm, env) {
-  const extractedFare = safeTrim(ride.fare_extracted);
-  const currency =
-    safeTrim(ride.currency) ||
-    detectCurrencyCodeFromMoneyString(extractedFare) ||
-    safeTrim(env?.defaultCurrency || "");
-
-  const calculatedFare = extractedFare
-    ? ""
-    : calculateDeterministicFare(distanceKm, {
-        baseFare: env?.fareBase,
-        perKmRate: env?.farePerKm,
-        currency: currency || env?.defaultCurrency
-      });
-
-  const finalFare = extractedFare || calculatedFare;
-
-  ride.fare_extracted = extractedFare;
-  ride.currency = currency;
-  ride.calculated_fare = calculatedFare;
-  ride.final_fare = finalFare;
-  ride.fare_type = extractedFare ? safeTrim(ride.fare_type) || "quoted" : finalFare ? "calculated" : "";
-  return ride;
 }
 
 function normalizeAllowedGroupIds(groupIds) {
@@ -202,7 +195,19 @@ function normalizeAllowedGroupIds(groupIds) {
 
 async function safeLocalExtraction(localExtractor, rawMessage, context, logger) {
   try {
-    return createEmptyRideObject(localExtractor.extract(rawMessage, context));
+    if (localExtractor && typeof localExtractor.extractWithAnalysis === "function") {
+      const result = await localExtractor.extractWithAnalysis(rawMessage, context);
+      return {
+        ride: createEmptyRideObject(result?.record || result?.ride || result),
+        analysis:
+          result?.analysis && typeof result.analysis === "object" ? result.analysis : {}
+      };
+    }
+
+    return {
+      ride: createEmptyRideObject(localExtractor.extract(rawMessage, context)),
+      analysis: {}
+    };
   } catch (error) {
     const summary = summarizeKnownError(error, {
       stage: "local_extraction",
@@ -216,11 +221,14 @@ async function safeLocalExtraction(localExtractor, rawMessage, context, logger) 
       reason: summary.likelyCause || "Message format may be unsupported",
       error
     });
-    return createEmptyRideObject(context);
+    return {
+      ride: createEmptyRideObject(context),
+      analysis: {}
+    };
   }
 }
 
-async function safeOpenAiNormalization(openaiNormalizer, rawMessage, extracted, logger) {
+async function safeOpenAiNormalization(openaiNormalizer, rawMessage, extracted, analysis, logger) {
   try {
     if (!openaiNormalizer) {
       return createEmptyNormalizationObject(extracted);
@@ -232,7 +240,8 @@ async function safeOpenAiNormalization(openaiNormalizer, rawMessage, extracted, 
           rawMessage,
           raw_message: rawMessage,
           extracted,
-          deterministicExtraction: extracted
+          deterministicExtraction: extracted,
+          analysis
         })
       );
     }
@@ -261,12 +270,6 @@ async function safeOpenAiNormalization(openaiNormalizer, rawMessage, extracted, 
 
 async function safeGeocode(geocoder, address, logger, field) {
   if (!safeTrim(address)) {
-    logger.info("Geocode skipped", {
-      stage: "geocoding",
-      field,
-      fallbackUsed: true,
-      reason: "address_missing"
-    });
     return null;
   }
 
@@ -289,10 +292,7 @@ async function safeGeocode(geocoder, address, logger, field) {
       logger.info("Geocode completed", {
         stage: "geocoding",
         field,
-        fallbackUsed: false,
-        reason: "coordinates_resolved",
-        lat: Number(result.lat),
-        lng: Number(result.lng)
+        fallbackUsed: false
       });
       return result;
     }
@@ -324,13 +324,6 @@ async function safeGeocode(geocoder, address, logger, field) {
 
 async function safeRoute(osrmClient, origin, destination, logger) {
   if (!origin || !destination) {
-    logger.info("OSRM skipped", {
-      stage: "osrm_route",
-      fallbackUsed: true,
-      reason: "coordinates_missing",
-      originAvailable: Boolean(origin),
-      destinationAvailable: Boolean(destination)
-    });
     return null;
   }
 
@@ -352,9 +345,7 @@ async function safeRoute(osrmClient, origin, destination, logger) {
       logger.info("OSRM route completed", {
         stage: "osrm_route",
         fallbackUsed: false,
-        reason: result.distance_text || "route_resolved",
-        distanceMeters: result.distance_meters,
-        durationSeconds: result.duration_seconds || 0
+        reason: result.distance_text || "route_resolved"
       });
       return result;
     }
@@ -389,17 +380,102 @@ function hasUsefulRawText(text) {
   return alphaNumericCount >= 6;
 }
 
-function createReviewPayload(ride) {
-  return createEmptyRideObject({
-    source_name: ride.source_name,
-    group_name: ride.group_name,
-    raw_message: ride.raw_message,
-    message_id: ride.message_id,
-    source_group: ride.source_group,
-    received_at: ride.received_at,
-    parser_confidence: ride.parser_confidence,
-    status: ride.status
-  });
+function splitBySeparatorBlocks(text) {
+  const normalized = normalizeText(text);
+  if (!normalized) return [];
+
+  const parts = normalized
+    .split(/\n-{5,}\n/gi)
+    .map((part) => normalizeText(part))
+    .filter(hasUsefulRawText);
+
+  return parts.length > 1 ? parts : [];
+}
+
+function segmentByMarkerLines(text, markerPattern, minimumMarkers = 2) {
+  const rawLines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  const cleanedLines = rawLines.map((line) => normalizeText(line));
+  const markerIndexes = [];
+
+  for (let index = 0; index < cleanedLines.length; index += 1) {
+    if (markerPattern.test(cleanedLines[index])) {
+      markerIndexes.push(index);
+    }
+  }
+
+  if (markerIndexes.length < minimumMarkers) return [];
+
+  const sharedPrefix = normalizeText(rawLines.slice(0, markerIndexes[0]).join("\n"));
+  const blocks = [];
+
+  for (let index = 0; index < markerIndexes.length; index += 1) {
+    const start = markerIndexes[index];
+    const end = index + 1 < markerIndexes.length ? markerIndexes[index + 1] : rawLines.length;
+    const blockBody = normalizeText(rawLines.slice(start, end).join("\n"));
+    if (!hasUsefulRawText(blockBody)) continue;
+
+    const block = sharedPrefix ? normalizeText(`${sharedPrefix}\n${blockBody}`) : blockBody;
+    if (hasUsefulRawText(block)) {
+      blocks.push(block);
+    }
+  }
+
+  return blocks;
+}
+
+function splitGoingComingBackBlocks(text) {
+  const rawLines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  const cleanedLines = rawLines.map((line) =>
+    normalizeText(String(line || "").replace(/^[^\p{L}\p{N}]+/u, ""))
+  );
+  const markerIndexes = [];
+
+  for (let index = 0; index < cleanedLines.length; index += 1) {
+    if (/^(?:going|coming\s+back)\b/i.test(cleanedLines[index])) {
+      markerIndexes.push(index);
+    }
+  }
+
+  if (markerIndexes.length < 2) return [];
+
+  const blocks = [];
+  for (let index = 0; index < markerIndexes.length; index += 1) {
+    const start = markerIndexes[index];
+    const end = index + 1 < markerIndexes.length ? markerIndexes[index + 1] : rawLines.length;
+    const block = normalizeText(rawLines.slice(start, end).join("\n"));
+    if (hasUsefulRawText(block)) {
+      blocks.push(block);
+    }
+  }
+  return blocks;
+}
+
+function splitMessageIntoRideBlocks(rawText) {
+  const normalized = normalizeText(rawText);
+  if (!normalized) return [];
+
+  const strategies = [
+    () => splitBySeparatorBlocks(normalized),
+    () => splitGoingComingBackBlocks(normalized),
+    () => segmentByMarkerLines(normalized, /^\(job\s*\d+\)/i, 2),
+    () => segmentByMarkerLines(normalized, /^\d+\.\s*at\b/i, 2),
+    () => segmentByMarkerLines(normalized, /^at\s*\d{1,2}(?::\d{1,2})?\b/i, 2),
+    () =>
+      segmentByMarkerLines(
+        normalized,
+        /^(?:today|tomorrow|tonight)\s*@?\s*\d{1,2}(?::\d{1,2})?\s*(?:am|pm)?\b/i,
+        2
+      )
+  ];
+
+  for (const strategy of strategies) {
+    const blocks = strategy().map((block) => normalizeText(block)).filter(hasUsefulRawText);
+    if (blocks.length > 1) {
+      return blocks;
+    }
+  }
+
+  return [normalized];
 }
 
 async function safeExtractOcrText(ocrExtractor, message, logger, context = {}) {
@@ -410,11 +486,6 @@ async function safeExtractOcrText(ocrExtractor, message, logger, context = {}) {
   try {
     const media = await message.downloadMedia();
     if (!media || !ocrExtractor.isSupportedImageMimeType(media.mimetype)) {
-      logger.debug("OCR skipped for non-image media", {
-        stage: "ocr",
-        fallbackUsed: true,
-        reason: safeTrim(media?.mimetype) || "media_missing"
-      });
       return "";
     }
 
@@ -425,18 +496,12 @@ async function safeExtractOcrText(ocrExtractor, message, logger, context = {}) {
     );
 
     if (!hasUsefulRawText(ocrText)) {
-      logger.info("OCR yielded no useful text", {
-        stage: "ocr",
-        fallbackUsed: true,
-        reason: safeTrim(media?.mimetype) || "image"
-      });
       return "";
     }
 
     logger.info("OCR text extracted from media", {
       stage: "ocr",
-      fallbackUsed: false,
-      reason: safePreview(ocrText)
+      fallbackUsed: false
     });
     return ocrText;
   } catch (error) {
@@ -463,16 +528,27 @@ async function buildMessageAttempts({ message, messageId, normalizedBody, ocrExt
   function pushAttempt(sourceKind, rawText) {
     const normalizedRawText = normalizeText(rawText);
     if (!hasUsefulRawText(normalizedRawText)) return;
+    const blocks = splitMessageIntoRideBlocks(normalizedRawText);
 
-    const fingerprint = normalizedRawText.toLowerCase();
-    if (seen.has(fingerprint)) return;
-    seen.add(fingerprint);
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex += 1) {
+      const blockText = normalizeText(blocks[blockIndex]);
+      if (!hasUsefulRawText(blockText)) continue;
 
-    attempts.push({
-      sourceKind,
-      rawText: normalizedRawText,
-      attemptMessageId: sourceKind === "text" ? messageId : `${messageId}:${sourceKind}`
-    });
+      const fingerprint = blockText.toLowerCase();
+      if (seen.has(fingerprint)) continue;
+      seen.add(fingerprint);
+
+      attempts.push({
+        sourceKind: blocks.length > 1 ? `${sourceKind}:${blockIndex + 1}` : sourceKind,
+        rawText: blockText,
+        attemptMessageId:
+          sourceKind === "text"
+            ? blocks.length > 1
+              ? `${messageId}:text:${blockIndex + 1}`
+              : messageId
+            : `${messageId}:${sourceKind}${blocks.length > 1 ? `:${blockIndex + 1}` : ""}`
+      });
+    }
   }
 
   pushAttempt("text", normalizedBody);
@@ -505,11 +581,10 @@ async function processRideAttempt({
   openaiNormalizer,
   geocoder,
   osrmClient,
-  appendRideRow,
-  appendReviewRow,
   appendRow,
+  appendReviewRow,
   groupName,
-  groupFilterId,
+  sourceName,
   receivedAt,
   chatId
 }) {
@@ -518,8 +593,6 @@ async function processRideAttempt({
     logger.info("Attempt skipped as duplicate", {
       stage: "dedupe",
       messageId: attempt.attemptMessageId,
-      chatId,
-      fallbackUsed: true,
       reason: attempt.sourceKind
     });
     return { skipped: true, reason: "duplicate" };
@@ -529,46 +602,47 @@ async function processRideAttempt({
     stage: "ingest",
     messageId: attempt.attemptMessageId,
     sourceGroup: groupName,
-    chatId,
+    sourceName,
     reason: attempt.sourceKind
   });
 
   const extractionContext = {
-    source_name: "whatsapp",
+    source_name: sourceName,
     group_name: groupName,
-    source_group: groupFilterId,
     message_id: attempt.attemptMessageId,
-    received_at: receivedAt
+    received_at: receivedAt,
+    source_time: formatSourceTime(receivedAt, env?.appTimeZone)
   };
 
-  const localExtracted = await safeLocalExtraction(
+  const localExtractionResult = await safeLocalExtraction(
     localExtractor,
     attempt.rawText,
     extractionContext,
     logger
   );
+  const localExtracted = localExtractionResult.ride;
+  const localAnalysis = localExtractionResult.analysis || {};
 
   const aiNormalized = await safeOpenAiNormalization(
     openaiNormalizer,
     attempt.rawText,
     localExtracted,
+    localAnalysis,
     logger
   );
 
   let ride = mergeLocalAndAi(localExtracted, aiNormalized);
-  ride.raw_message = attempt.rawText;
-  ride.source_name = safeTrim(ride.source_name) || "whatsapp";
   ride.group_name = safeTrim(ride.group_name) || groupName;
-  ride.source_group = groupFilterId;
-  ride.message_id = attempt.attemptMessageId;
-  ride.received_at = receivedAt;
+  ride.source_name = safeTrim(ride.source_name) || sourceName;
+  ride.source_time =
+    safeTrim(ride.source_time) || formatSourceTime(receivedAt, env?.appTimeZone);
   ride = createEmptyRideObject(ride);
 
   if (!safeTrim(ride.refer)) {
     ride.refer = generateRefer({
       messageId: attempt.attemptMessageId,
       rawMessage: attempt.rawText,
-      groupId: groupFilterId || chatId,
+      groupId: chatId,
       timestamp: receivedAt
     });
   }
@@ -580,79 +654,63 @@ async function processRideAttempt({
   let distanceKm = null;
   if (route && Number.isFinite(route.distance_meters)) {
     distanceKm = metersToKm(route.distance_meters);
-    ride.distance = safeTrim(route.distance_text || "");
+    ride.distance = formatDistanceMiles(route.distance_meters);
   } else {
     ride.distance = "";
-    logger.warn("Route distance unavailable", {
-      stage: "osrm_route",
-      messageId: attempt.attemptMessageId,
-      refer: ride.refer,
-      fallbackUsed: true
-    });
   }
 
   applyFareFieldsToRide(ride, distanceKm, env);
+  ride = createEmptyRideObject(ride);
 
-  const routingDecision = determineReviewRouting({
+  const routingDecision = determineRoutingDecision({
     ride,
+    analysis: localAnalysis,
     pickupGeocode,
     dropOffGeocode
   });
-  ride.parser_confidence = routingDecision.parserConfidence;
-  ride.status = routingDecision.status;
 
-  const ridePayload =
-    routingDecision.routeTarget === "review" ? createReviewPayload(ride) : createEmptyRideObject(ride);
-  const primaryAppender =
-    routingDecision.routeTarget === "review"
-      ? appendReviewRow || appendRideRow || appendRow
-      : appendRideRow || appendReviewRow || appendRow;
-
-  const finalRow = buildSheetRow(ridePayload);
-
-  logger.info("Ride routing decision computed", {
-    stage: "review_routing",
-    messageId: attempt.attemptMessageId,
-    refer: ride.refer,
-    status: ride.status,
-    parserConfidence: ride.parser_confidence,
-    routeTarget: routingDecision.routeTarget,
-    reviewReason: routingDecision.reviewReason || "ready_for_rides",
-    pickupResolved: routingDecision.pickupResolved,
-    dropOffResolved: routingDecision.dropOffResolved,
-    sourceKind: attempt.sourceKind
-  });
-
-  if (typeof primaryAppender !== "function") {
-    throw new Error("No sheet append function configured for routed ride");
+  if (typeof appendRow !== "function") {
+    throw new Error("No sheet append function configured");
   }
 
-  await primaryAppender(ridePayload);
+  const targetAppender =
+    routingDecision.target === "review" && typeof appendReviewRow === "function"
+      ? appendReviewRow
+      : appendRow;
 
+  logger.info("Final ride row prepared for Google Sheets", {
+    stage: "sheets_append",
+    fallbackUsed: false,
+    reason: attempt.sourceKind,
+    target: routingDecision.target,
+    reviewReasons: routingDecision.reasons,
+    rowObject: buildSheetRowObject(ride)
+  });
+
+  await targetAppender(ride);
   dedupe.markProcessed(attemptDedupeKey, {
     messageId: attempt.attemptMessageId,
     chatId,
     refer: ride.refer,
     sourceKind: attempt.sourceKind,
+    target: routingDecision.target,
     processedAt: new Date().toISOString()
   });
 
-  logger.info("Ride attempt processed and appended successfully", {
+  logger.info("Ride attempt processed", {
     stage: "completed",
     messageId: attempt.attemptMessageId,
-    sourceGroup: groupName,
     refer: ride.refer,
-    status: ride.status,
-    parserConfidence: ride.parser_confidence,
-    sourceKind: attempt.sourceKind,
-    row: maskRowForLog(finalRow)
+    sourceGroup: ride.group_name,
+    target: routingDecision.target,
+    reviewReasons: routingDecision.reasons,
+    rowColumns: buildSheetRow(ride).length
   });
 
   return {
     skipped: false,
     ride,
-    ridePayload,
-    routingDecision
+    target: routingDecision.target
   };
 }
 
@@ -674,13 +732,6 @@ function createMessageHandler({
   const allowFromMeMessages = Boolean(env?.allowFromMeMessages);
   let warnedAboutEmptyAllowList = false;
 
-  logger.debug("Allowed groups loaded", {
-    stage: "ingest_filter",
-    reason: `count=${allowedGroupIds.length}`,
-    allowedGroupIds,
-    allowFromMeMessages
-  });
-
   return async function handleMessage(message) {
     const fallbackMessageId = resolveMessageId(message);
     const fallbackChatId = safeTrim(message?.from || "");
@@ -693,24 +744,9 @@ function createMessageHandler({
       const serializedChatId = safeTrim(chat?.id?._serialized || "");
       const fallbackIncomingChatId = safeTrim(message?.from || "");
       const chatId = serializedChatId || fallbackIncomingChatId;
-      const chatName = safeTrim(chat?.name || chat?.formattedTitle || "");
-      const groupName = chatName || chatId;
+      const groupName = safeTrim(chat?.name || chat?.formattedTitle || "") || chatId;
+      const sourceName = await resolveSourceName(message);
       const receivedAt = resolveReceivedAtIso(message);
-      const preview = safePreview(message?.body || "");
-
-      logger.debug("Incoming message received", {
-        stage: "ingest_filter",
-        messageId,
-        chatId,
-        chatName,
-        sourceGroup: groupName,
-        isGroup: Boolean(chat?.isGroup),
-        fromMe: Boolean(message?.fromMe),
-        hasMedia: Boolean(message?.hasMedia),
-        messageType: safeTrim(message?.type || ""),
-        reason: preview,
-        preview
-      });
 
       const skipState = shouldSkipMessage({
         message,
@@ -719,12 +755,6 @@ function createMessageHandler({
         allowFromMeMessages
       });
       if (skipState.skip) {
-        logger.debug("Message skipped", {
-          stage: "ingest_filter",
-          reason: skipState.reason,
-          messageId,
-          chatId
-        });
         return;
       }
 
@@ -742,28 +772,9 @@ function createMessageHandler({
       const groupFilterId = serializedChatId || chatId;
       const isAllowedGroup = allowedGroups.has(groupFilterId);
 
-      logger.debug("Allowed group match evaluated", {
-        stage: "ingest_filter",
-        currentChatId: groupFilterId,
-        allowedGroupIds,
-        filterMatch: isAllowedGroup
-      });
-
       if (!isAllowedGroup) {
-        logger.debug("Message skipped: group not allowed", {
-          stage: "ingest_filter",
-          messageId,
-          chatId
-        });
         return;
       }
-
-      logger.info("Message accepted for processing", {
-        stage: "ingest_filter",
-        messageId,
-        sourceGroup: groupName,
-        chatId
-      });
 
       const normalizedBody = normalizeText(String(message.body || ""));
       const attempts = await buildMessageAttempts({
@@ -775,14 +786,10 @@ function createMessageHandler({
       });
 
       if (attempts.length === 0) {
-        logger.info("Message skipped: no useful text payloads found", {
-          stage: "ingest_filter",
-          messageId,
-          chatId,
-          fallbackUsed: true
-        });
         return;
       }
+
+      const primaryAppender = appendRideRow || appendRow;
 
       for (const attempt of attempts) {
         try {
@@ -796,11 +803,10 @@ function createMessageHandler({
             openaiNormalizer,
             geocoder,
             osrmClient,
-            appendRideRow,
+            appendRow: primaryAppender,
             appendReviewRow,
-            appendRow,
             groupName,
-            groupFilterId,
+            sourceName,
             receivedAt,
             chatId
           });
@@ -819,7 +825,6 @@ function createMessageHandler({
             reason: summary.likelyCause || "This ride attempt was skipped after failure",
             error
           });
-          return;
         }
       }
     } catch (error) {
@@ -843,8 +848,6 @@ function createMessageHandler({
 
 module.exports = {
   createMessageHandler,
-  determineReviewRouting,
-  createReviewPayload,
   buildMessageAttempts,
   hasUsefulRawText
 };

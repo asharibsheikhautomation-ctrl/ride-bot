@@ -44,12 +44,8 @@ function isRetryableOsrmError(error) {
 
 function formatDistanceText(distanceMeters) {
   if (!Number.isFinite(distanceMeters) || distanceMeters < 0) return "";
-
-  if (distanceMeters >= 1000) {
-    return `${(distanceMeters / 1000).toFixed(1)} km`;
-  }
-
-  return `${Math.round(distanceMeters)} m`;
+  const miles = distanceMeters / 1609.344;
+  return String(Math.round(miles));
 }
 
 function formatDurationText(durationSeconds) {

@@ -1,7 +1,17 @@
-﻿const { env } = require("../config/env");
+const { env } = require("../config/env");
 const { safeTrim } = require("../utils/text");
 
+const VEHICLE_MULTIPLIERS = Object.freeze([
+  { pattern: /\b(saloon|sedan)\b/i, multiplier: 1 },
+  { pattern: /\bestate\b/i, multiplier: 1.1 },
+  { pattern: /\b(exec|executive)\b/i, multiplier: 1.35 },
+  { pattern: /\bmpv\b/i, multiplier: 1.45 },
+  { pattern: /\b(suv|4x4)\b/i, multiplier: 1.55 },
+  { pattern: /\b(van|minibus)\b/i, multiplier: 1.7 }
+]);
+
 function toFiniteNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -12,7 +22,6 @@ function normalizeMoneyString(value) {
   const text = safeTrim(value);
   if (!text) return "";
 
-  // Keep user/source-provided fare intact except whitespace normalization.
   return text.replace(/\s+/g, " ");
 }
 
@@ -34,23 +43,25 @@ function metersToKm(meters) {
   return value / 1000;
 }
 
-function resolveCurrencySymbol(currencyCode) {
-  const code = safeTrim(currencyCode || "GBP").toUpperCase();
-  const map = {
-    GBP: "\u00A3",
-    USD: "$",
-    EUR: "EUR ",
-    PKR: "PKR "
-  };
-  return map[code] || `${code} `;
-}
-
 function formatMoney(amount, currencyCode) {
   const value = toFiniteNumber(amount);
   if (value === null) return "";
 
-  const symbol = resolveCurrencySymbol(currencyCode);
-  return `${symbol}${value.toFixed(2)}`;
+  void currencyCode;
+  return value.toFixed(2);
+}
+
+function resolveVehicleMultiplier(vehicleType) {
+  const normalizedVehicleType = safeTrim(vehicleType);
+  if (!normalizedVehicleType) return null;
+
+  for (const candidate of VEHICLE_MULTIPLIERS) {
+    if (candidate.pattern.test(normalizedVehicleType)) {
+      return candidate.multiplier;
+    }
+  }
+
+  return null;
 }
 
 function calculateDeterministicFare(distanceKm, cfg = {}) {
@@ -64,20 +75,18 @@ function calculateDeterministicFare(distanceKm, cfg = {}) {
   const currency = safeTrim(
     cfg.currency ?? cfg.defaultCurrency ?? env.defaultCurrency ?? "GBP"
   );
+  const vehicleMultiplier = resolveVehicleMultiplier(
+    cfg.requiredVehicle ?? cfg.required_vehicle ?? cfg.vehicleType
+  );
 
-  if (baseFare === null || perKmRate === null) {
+  if (baseFare === null || perKmRate === null || vehicleMultiplier === null) {
     return "";
   }
 
-  const total = baseFare + km * perKmRate;
+  const total = (baseFare + km * perKmRate) * vehicleMultiplier;
   return formatMoney(total, currency);
 }
 
-/*
-Priority rule:
-1) If extracted fare exists, preserve it exactly (normalized whitespace only).
-2) Otherwise compute deterministic fare from distance and config.
-*/
 function calculateFare(distanceKm, extractedFare, cfg = {}) {
   const preserved = normalizeMoneyString(extractedFare);
   if (preserved) {
@@ -87,18 +96,11 @@ function calculateFare(distanceKm, extractedFare, cfg = {}) {
   return calculateDeterministicFare(distanceKm, cfg);
 }
 
-/*
-Examples:
-calculateFare(12.5, "", { baseFare: 5, perKmRate: 2, currency: "GBP" }) -> "\u00A330.00"
-calculateFare(8, "\u00A350", { baseFare: 5, perKmRate: 2, currency: "GBP" }) -> "\u00A350"
-calculateFare(metersToKm(128400), "", { baseFare: 10, perKmRate: 1.25, currency: "GBP" }) -> "\u00A3170.50"
-*/
-
 module.exports = {
   metersToKm,
   normalizeMoneyString,
   detectCurrencyCodeFromMoneyString,
+  resolveVehicleMultiplier,
   calculateDeterministicFare,
   calculateFare
 };
-

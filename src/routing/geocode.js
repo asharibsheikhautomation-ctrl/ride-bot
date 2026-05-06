@@ -16,6 +16,7 @@ const ADDRESS_LABEL_PATTERN =
   /^\s*(?:[\u2022\u00B7\u25AA\u25E6\u25CF\u25C6\u25BA\-*]+\s*)?(pick(?:\s*|-)?up|drop(?:\s*|-)?off|dropoff)\s*[:\-]?\s*(.*)$/i;
 const NON_ADDRESS_SECTION_PATTERN =
   /^(landing|route|head\s*passenger|mobile\s*number|flight|arriving\s*from|expires?)\b/i;
+const UK_POSTCODE_PATTERN = /\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b/i;
 
 function cleanAddressLine(line) {
   return String(line || "")
@@ -91,6 +92,56 @@ function addressFingerprint(address) {
   return crypto.createHash("sha256").update(address).digest("hex").slice(0, 12);
 }
 
+function extractPostcode(address) {
+  const match = String(address || "").match(UK_POSTCODE_PATTERN);
+  return safeTrim(match?.[1] || "").toUpperCase();
+}
+
+function simplifyAddress(address) {
+  const text = safeTrim(String(address || ""));
+  if (!text) return "";
+
+  const withoutPostcode = safeTrim(
+    text
+      .replace(UK_POSTCODE_PATTERN, "")
+      .replace(/,\s*,+/g, ", ")
+      .replace(/[,\s]+$/, "")
+  );
+  if (!withoutPostcode) return "";
+
+  const withoutLeadingNumber = safeTrim(
+    withoutPostcode.replace(/^\d{1,5}[A-Za-z]?\s+/, "").replace(/[,\s]+$/, "")
+  );
+  return withoutLeadingNumber || withoutPostcode;
+}
+
+function buildGeocodeCandidates(address) {
+  const exact = cleanAddressForGeocoding(address);
+  const postcode = extractPostcode(exact);
+  const simplified = simplifyAddress(exact);
+  const seen = new Set();
+  const candidates = [];
+
+  for (const candidate of [
+    { attemptType: "exact", query: exact },
+    { attemptType: "postcode", query: postcode },
+    { attemptType: "simplified", query: simplified }
+  ]) {
+    const query = safeTrim(candidate.query);
+    if (!query) continue;
+
+    const key = query.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push({
+      attemptType: candidate.attemptType,
+      query
+    });
+  }
+
+  return candidates;
+}
+
 function isValidLatLng(lat, lng) {
   return (
     Number.isFinite(lat) &&
@@ -109,6 +160,7 @@ function isRetryableGeocodeError(error) {
 async function geocodeWithNominatim({
   originalAddress,
   cleanedAddress,
+  attemptType,
   logger,
   httpClient,
   baseUrl,
@@ -124,7 +176,7 @@ async function geocodeWithNominatim({
 
     logger.debug("Geocoding request prepared", {
       stage: "geocoding",
-      reason: "nominatim query",
+      reason: `nominatim query ${attemptType || "exact"}`,
       originalAddressPreview: addressPreview(originalAddress),
       cleanedAddressPreview: addressPreview(cleanedAddress),
       cleanedAddressExact: cleanedAddress,
@@ -185,7 +237,7 @@ async function geocodeWithNominatim({
 
       logger.warn(summary.summary, {
         stage: "geocoding",
-        reason: `api_empty_array q="${addressPreview(cleanedAddress, 90)}"`,
+        reason: `${attemptType || "exact"} api_empty_array q="${addressPreview(cleanedAddress, 90)}"`,
         fallbackUsed: true,
         originalAddress,
         cleanedAddress,
@@ -275,8 +327,8 @@ function createGeocoder(options = {}) {
   async function geocodeAddress(address) {
     try {
       const originalAddress = String(address || "");
-      const cleanedAddress = cleanAddressForGeocoding(originalAddress);
-      if (!cleanedAddress) {
+      const candidates = buildGeocodeCandidates(originalAddress);
+      if (candidates.length === 0) {
         logger.warn("Geocoding failed: address is empty", {
           stage: "geocoding",
           reason: "address_empty",
@@ -303,16 +355,32 @@ function createGeocoder(options = {}) {
         return null;
       }
 
-      return await providerHandler({
-        originalAddress,
-        cleanedAddress,
-        apiKey,
-        baseUrl,
-        userAgent,
-        timeoutMs,
-        logger,
-        httpClient
-      });
+      for (const candidate of candidates) {
+        logger.info("Geocode retry attempt", {
+          stage: "geocoding",
+          fallbackUsed: candidate.attemptType !== "exact",
+          reason: candidate.attemptType,
+          query: candidate.query
+        });
+
+        const result = await providerHandler({
+          originalAddress,
+          cleanedAddress: candidate.query,
+          attemptType: candidate.attemptType,
+          apiKey,
+          baseUrl,
+          userAgent,
+          timeoutMs,
+          logger,
+          httpClient
+        });
+
+        if (result) {
+          return result;
+        }
+      }
+
+      return null;
     } catch (error) {
       const summary = summarizeKnownError(error, {
         stage: "geocoding",
@@ -348,6 +416,7 @@ async function geocodeAddress(address) {
 module.exports = {
   geocodeAddress,
   createGeocoder,
-  cleanAddressForGeocoding
+  cleanAddressForGeocoding,
+  buildGeocodeCandidates
 };
 

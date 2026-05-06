@@ -3,74 +3,64 @@ const {
   createEmptyNormalizationObject,
   pickNormalizationFields
 } = require("./schemas");
+const {
+  containsLocationContamination,
+  normalizeVehicleText
+} = require("./localExtractor");
 const { executeWithRetry } = require("../utils/retry");
 const { summarizeKnownError } = require("../utils/logger");
 
-const PROTECTED_FIELDS = new Set([
-  "distance",
-  "fare_extracted",
-  "currency",
-  "fare_type",
-  "calculated_fare",
-  "final_fare"
-]);
+const PROTECTED_FIELDS = new Set(["distance", "fare", "source_time"]);
 const CANONICAL_SCHEMA_TARGET = Object.freeze([...NORMALIZATION_FIELDS]);
+const LOCKABLE_FIELDS = new Set([
+  "pickup_day_date",
+  "starting_timing",
+  "pickup",
+  "drop_off",
+  "required_vehicle",
+  "payment_status",
+  "fare",
+  "source_time"
+]);
 
 const NORMALIZATION_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
     refer: { type: "string" },
-    day_label: { type: "string" },
-    pickup_date: { type: "string" },
-    pickup_time: { type: "string" },
-    pickup_datetime: { type: "string" },
-    asap: { type: "string" },
+    group_name: { type: "string" },
+    source_name: { type: "string" },
+    source_time: { type: "string" },
+    pickup_day_date: { type: "string" },
+    starting_timing: { type: "string" },
     pickup: { type: "string" },
-    via_1: { type: "string" },
-    via_2: { type: "string" },
-    via_3: { type: "string" },
     drop_off: { type: "string" },
-    route_summary: { type: "string" },
     distance: { type: "string" },
-    fare_extracted: { type: "string" },
-    currency: { type: "string" },
-    fare_type: { type: "string" },
-    calculated_fare: { type: "string" },
-    final_fare: { type: "string" },
+    fare: { type: "string" },
     required_vehicle: { type: "string" },
-    seat_count: { type: "string" },
-    child_seat: { type: "string" },
-    wait_and_return: { type: "string" },
-    passenger_count: { type: "string" },
-    pet_dog: { type: "string" },
-    payment_status: { type: "string" },
-    special_notes: { type: "string" },
-    expiry: { type: "string" },
-    expiry_utc: { type: "string" },
-    head_passenger: { type: "string" },
-    mobile_number: { type: "string" },
-    flight_number: { type: "string" },
-    arriving_from: { type: "string" }
+    payment_status: { type: "string" }
   },
   required: [...NORMALIZATION_FIELDS]
 };
 
 const SYSTEM_INSTRUCTION = [
-  "You normalize WhatsApp ride-booking text into a canonical ride JSON object.",
+  "You normalize WhatsApp ride-booking text into a strict Google Sheets row schema.",
   "Return JSON only.",
   "The output must match the canonical schema target exactly.",
   "Every schema key must be present.",
   "Every value must be a string.",
   "Use empty string for any missing or unknown value.",
   "Treat deterministic extraction as the source of truth when available.",
-  "Do not invent or calculate route distance.",
-  "Do not invent or calculate fare_extracted, calculated_fare, or final_fare.",
-  "If fare_extracted is present in deterministic extraction, preserve it.",
-  "Preserve pickup, via, and drop_off text faithfully.",
-  "Put leftover useful ride text that does not fit another field into special_notes.",
-  "Do not look up maps, distances, routes, or external data.",
-  "Only clean formatting, whitespace, splitting, and obvious field assignment."
+  "Do not invent or calculate distance.",
+  "Do not invent or calculate fare.",
+  "Do not invent source_time. Keep runtime source_time exactly as provided by deterministic extraction.",
+  "pickup must contain only the origin.",
+  "drop_off must contain only the destination.",
+  "Never put fare, payment, flight, reference, or time text into pickup or drop_off.",
+  "required_vehicle must be a clean vehicle type only, or empty string.",
+  "If the source says from X to Y, X -> Y, X - Y, or pickup X drop Y, split them correctly.",
+  "Only clean formatting and place source text into the matching schema fields.",
+  "Do not add extra metadata or explanation."
 ].join(" ");
 
 function safeString(value) {
@@ -205,6 +195,11 @@ function validateNormalizedOutput(value, options = {}) {
   const deterministicExtraction = createEmptyNormalizationObject(
     options.deterministicExtraction || {}
   );
+  const lockedFields = new Set(
+    Array.isArray(options.lockedFields)
+      ? options.lockedFields.filter((field) => LOCKABLE_FIELDS.has(field))
+      : []
+  );
 
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     const error = new Error("Normalized output must be a JSON object");
@@ -231,16 +226,39 @@ function validateNormalizedOutput(value, options = {}) {
     }
   }
 
-  if (!candidate.special_notes) {
-    candidate.special_notes = deterministicExtraction.special_notes || "";
+  for (const key of canonicalSchemaTarget) {
+    if (!candidate[key] && safeString(deterministicExtraction[key])) {
+      candidate[key] = safeString(deterministicExtraction[key]);
+    }
   }
 
   for (const field of PROTECTED_FIELDS) {
+    candidate[field] = safeString(deterministicExtraction[field]);
+  }
+
+  for (const field of lockedFields) {
     if (safeString(deterministicExtraction[field])) {
       candidate[field] = safeString(deterministicExtraction[field]);
-    } else if (!candidate[field]) {
-      candidate[field] = "";
     }
+  }
+
+  if (
+    (candidate.pickup && containsLocationContamination(candidate.pickup)) ||
+    (candidate.drop_off && containsLocationContamination(candidate.drop_off))
+  ) {
+    const error = new Error("Normalized output contaminated location fields");
+    error.code = "OPENAI_INVALID_SCHEMA";
+    throw error;
+  }
+
+  if (candidate.required_vehicle) {
+    const normalizedVehicle = normalizeVehicleText(candidate.required_vehicle);
+    if (!normalizedVehicle) {
+      const error = new Error("Normalized output returned an invalid vehicle value");
+      error.code = "OPENAI_INVALID_SCHEMA";
+      throw error;
+    }
+    candidate.required_vehicle = normalizedVehicle;
   }
 
   return createEmptyNormalizationObject(candidate);
@@ -267,14 +285,18 @@ function mergeNormalized({ local, fromAi }) {
 function buildNormalizationPrompt({
   raw_message,
   deterministic_extraction,
-  canonical_schema_target
+  canonical_schema_target,
+  numbered_lines,
+  deterministic_candidate_map
 }) {
   return [
     "Normalize the deterministic extraction into the canonical schema target.",
     "Return schema-matching JSON only.",
-    "If the raw message contains useful leftover details that do not belong elsewhere, place them in special_notes.",
+    "Keep pickup and drop_off separated. Never merge both locations into pickup.",
     `canonical_schema_target:\n${JSON.stringify(canonical_schema_target)}`,
     `deterministic_extraction:\n${JSON.stringify(deterministic_extraction)}`,
+    `deterministic_candidate_map:\n${JSON.stringify(deterministic_candidate_map || {}, null, 2)}`,
+    `numbered_message_lines:\n${Array.isArray(numbered_lines) ? numbered_lines.join("\n") : ""}`,
     `raw_message:\n${raw_message}`
   ].join("\n\n");
 }
@@ -284,12 +306,16 @@ async function requestStructuredNormalization({
   model,
   raw_message,
   deterministic_extraction,
-  canonical_schema_target
+  canonical_schema_target,
+  numbered_lines,
+  deterministic_candidate_map
 }) {
   const prompt = buildNormalizationPrompt({
     raw_message,
     deterministic_extraction,
-    canonical_schema_target
+    canonical_schema_target,
+    numbered_lines,
+    deterministic_candidate_map
   });
 
   if (client?.responses?.create) {
@@ -352,7 +378,6 @@ function createOpenAiNormalizer(options = {}) {
   let client = providedClient || null;
   if (!client && apiKey) {
     try {
-      // Lazy load so app can still boot in environments where deps are not installed yet.
       // eslint-disable-next-line global-require
       const OpenAI = require("openai");
       client = new OpenAI({ apiKey });
@@ -370,11 +395,32 @@ function createOpenAiNormalizer(options = {}) {
     const deterministic_extraction = pickNormalizationFields(
       input.deterministic_extraction ?? input.deterministicExtraction ?? input.extracted ?? {}
     );
+    const analysis =
+      input.analysis && typeof input.analysis === "object" && !Array.isArray(input.analysis)
+        ? input.analysis
+        : {};
     const canonical_schema_target = Array.isArray(input.canonical_schema_target)
       ? [...input.canonical_schema_target]
       : Array.isArray(input.canonicalSchemaTarget)
         ? [...input.canonicalSchemaTarget]
         : [...CANONICAL_SCHEMA_TARGET];
+    const numbered_lines = Array.isArray(input.numbered_lines)
+      ? [...input.numbered_lines]
+      : Array.isArray(input.numberedLines)
+        ? [...input.numberedLines]
+        : Array.isArray(analysis.numberedLines)
+          ? [...analysis.numberedLines]
+          : [];
+    const deterministic_candidate_map =
+      input.deterministic_candidate_map ||
+      input.deterministicCandidateMap ||
+      analysis.deterministicCandidateMap ||
+      {};
+    const lockedFields = Array.isArray(input.lockedFields)
+      ? [...input.lockedFields]
+      : Array.isArray(analysis.lockedFields)
+        ? [...analysis.lockedFields]
+        : [];
     const localNormalized = createEmptyNormalizationObject(deterministic_extraction);
     const safeFallback = createEmptyNormalizationObject(localNormalized);
 
@@ -397,7 +443,9 @@ function createOpenAiNormalizer(options = {}) {
             model,
             raw_message,
             deterministic_extraction: localNormalized,
-            canonical_schema_target
+            canonical_schema_target,
+            numbered_lines,
+            deterministic_candidate_map
           }),
         {
           maxAttempts: 3,
@@ -429,7 +477,8 @@ function createOpenAiNormalizer(options = {}) {
       const parsed = parseModelJson(responseText);
       const aiObject = validateNormalizedOutput(parsed, {
         deterministicExtraction: localNormalized,
-        canonicalSchemaTarget: canonical_schema_target
+        canonicalSchemaTarget: canonical_schema_target,
+        lockedFields
       });
       const merged = mergeNormalized({
         local: localNormalized,
@@ -439,8 +488,7 @@ function createOpenAiNormalizer(options = {}) {
       safeLogger.info("OpenAI normalization completed", {
         stage: "openai_normalization",
         fallbackUsed: false,
-        model,
-        reason: `filledFields=${NORMALIZATION_FIELDS.filter((key) => Boolean(merged[key])).length}`
+        model
       });
 
       return merged;
@@ -464,7 +512,6 @@ function createOpenAiNormalizer(options = {}) {
     }
   }
 
-  // Backward-compatible method name used by earlier scaffold code.
   async function normalize(localRecord, rawText) {
     return normalizeWithOpenAI({
       rawMessage: rawText,

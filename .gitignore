@@ -2,6 +2,7 @@
 
 storageState.json
 data/qr.png
+data/dedupe-store.json
 
 node_modules/
 node_modules

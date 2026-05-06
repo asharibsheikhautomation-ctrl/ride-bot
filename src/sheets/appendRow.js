@@ -1,7 +1,7 @@
 const { env } = require("../config/env");
 const { createLogger, summarizeKnownError } = require("../utils/logger");
 const {
-  DEFAULT_SHEET_HEADERS,
+  STRICT_SHEET_HEADERS,
   buildRowFromRideObject
 } = require("../extraction/schemas");
 const { executeWithRetry } = require("../utils/retry");
@@ -31,8 +31,72 @@ class SheetsAppendError extends Error {
   }
 }
 
-function buildSheetRow(ride = {}, headers = DEFAULT_SHEET_HEADERS) {
+function buildSheetRow(ride = {}, headers = STRICT_SHEET_HEADERS) {
   return buildRowFromRideObject(ride, headers);
+}
+
+function sanitizeHeaders(headers = []) {
+  return (Array.isArray(headers) ? headers : [])
+    .map((value) => safeTrim(value))
+    .filter(Boolean);
+}
+
+async function fetchSheetHeaders({
+  sheetsClient,
+  spreadsheetId,
+  worksheetName,
+  maxAttempts,
+  retryDelayMs,
+  logger
+}) {
+  try {
+    const response = await executeWithRetry(
+      async () =>
+        sheetsClient.spreadsheets.values.get({
+          spreadsheetId,
+          range: buildHeaderRange(worksheetName),
+          majorDimension: "ROWS"
+        }),
+      {
+        maxAttempts,
+        initialDelayMs: retryDelayMs,
+        maxDelayMs: retryDelayMs * 8,
+        shouldRetry: isTransientError
+      }
+    );
+
+    const rawHeaders = Array.isArray(response?.data?.values?.[0]) ? response.data.values[0] : [];
+    const headers = sanitizeHeaders(rawHeaders);
+
+    if (headers.length === 0) {
+      logger.warn("Google Sheets header row is empty; using strict defaults", {
+        stage: "sheets_append",
+        fallbackUsed: true,
+        reason: worksheetName
+      });
+      return [...STRICT_SHEET_HEADERS];
+    }
+
+    return headers;
+  } catch (error) {
+    const classification = classifyAppendFailure(error);
+    const summary = summarizeKnownError(error, {
+      stage: "sheets_append",
+      defaultSummary: "Google Sheets header lookup failed; using strict defaults",
+      fallbackUsed: true
+    });
+
+    logger.warn(summary.summary, {
+      stage: "sheets_append",
+      fallbackUsed: true,
+      status: classification.status || summary.status,
+      code: classification.errorCode || summary.code,
+      reason: classification.detail || summary.likelyCause || "Unable to read worksheet header row",
+      error
+    });
+
+    return [...STRICT_SHEET_HEADERS];
+  }
 }
 
 function isTransientError(error) {
@@ -198,78 +262,12 @@ function assertSheetPreconditions({ sheetsClient, spreadsheetId, worksheetName }
   }
 }
 
-function sanitizeHeaders(headers = []) {
-  return (Array.isArray(headers) ? headers : []).map((value, index) => {
-    const cleanValue = safeTrim(value);
-    if (cleanValue) return cleanValue;
-    return DEFAULT_SHEET_HEADERS[index] || `column_${index + 1}`;
-  });
-}
-
-async function fetchSheetHeaders({
-  sheetsClient,
-  spreadsheetId,
-  worksheetName,
-  maxAttempts,
-  retryDelayMs,
-  logger
-}) {
-  try {
-    const response = await executeWithRetry(
-      async () =>
-        sheetsClient.spreadsheets.values.get({
-          spreadsheetId,
-          range: buildHeaderRange(worksheetName),
-          majorDimension: "ROWS"
-        }),
-      {
-        maxAttempts,
-        initialDelayMs: retryDelayMs,
-        maxDelayMs: retryDelayMs * 8,
-        shouldRetry: isTransientError
-      }
-    );
-
-    const rawHeaders = Array.isArray(response?.data?.values?.[0]) ? response.data.values[0] : [];
-    const headers = sanitizeHeaders(rawHeaders);
-
-    if (headers.length === 0) {
-      logger.warn("Google Sheets header row is empty; using canonical defaults", {
-        stage: "sheets_append",
-        fallbackUsed: true,
-        reason: worksheetName
-      });
-      return [...DEFAULT_SHEET_HEADERS];
-    }
-
-    return headers;
-  } catch (error) {
-    const classification = classifyAppendFailure(error);
-    const summary = summarizeKnownError(error, {
-      stage: "sheets_append",
-      defaultSummary: "Google Sheets header lookup failed; using canonical defaults",
-      fallbackUsed: true
-    });
-
-    logger.warn(summary.summary, {
-      stage: "sheets_append",
-      fallbackUsed: true,
-      status: classification.status || summary.status,
-      code: classification.errorCode || summary.code,
-      reason:
-        classification.detail || summary.likelyCause || "Unable to read worksheet header row",
-      error
-    });
-
-    return [...DEFAULT_SHEET_HEADERS];
-  }
-}
-
 function createAppendRow(options = {}) {
   const sheetsClient = options.sheetsClient;
   const spreadsheetId = options.sheetId || options.spreadsheetId || env.googleSheetsId;
   const worksheetName = safeTrim(
     options.worksheetName ||
+      env.googleRidesWorksheetName ||
       env.googleWorksheetName ||
       extractWorksheetNameFromRange(options.range || env.googleSheetsRange || DEFAULT_RANGE)
   );
@@ -295,7 +293,6 @@ function createAppendRow(options = {}) {
       mode: env.logMode,
       baseMeta: { component: "sheets-append" }
     });
-
   let headerCache = null;
   let headerCacheUpdatedAt = 0;
 
@@ -319,7 +316,7 @@ function createAppendRow(options = {}) {
       logger
     });
 
-    headerCache = Array.isArray(headers) && headers.length > 0 ? headers : [...DEFAULT_SHEET_HEADERS];
+    headerCache = Array.isArray(headers) && headers.length > 0 ? headers : [...STRICT_SHEET_HEADERS];
     headerCacheUpdatedAt = now;
     return headerCache;
   }
@@ -328,7 +325,7 @@ function createAppendRow(options = {}) {
     assertSheetPreconditions({ sheetsClient, spreadsheetId, worksheetName });
 
     const headers = await resolveHeaders();
-    const row = buildSheetRow(ride, headers);
+    const row = buildRowFromRideObject(ride, headers);
     if (row.length !== headers.length) {
       throw new SheetsAppendError("Invalid sheet row shape", {
         code: "SHEETS_ROW_INVALID",

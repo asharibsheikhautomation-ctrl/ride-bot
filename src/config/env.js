@@ -191,7 +191,7 @@ const env = Object.freeze({
   googleWorksheetName: resolvedGoogleWorksheetName,
   googleRidesWorksheetName: safeString(
     process.env.GOOGLE_SHEETS_RIDES_WORKSHEET_NAME,
-    "Rides"
+    resolvedGoogleWorksheetName || "Rides"
   ),
   googleNeedsReviewWorksheetName: safeString(
     process.env.GOOGLE_SHEETS_NEEDS_REVIEW_WORKSHEET_NAME,
@@ -200,7 +200,7 @@ const env = Object.freeze({
   googleRidesRange: resolveWorksheetRange(
     process.env.GOOGLE_SHEETS_RIDES_RANGE,
     process.env.GOOGLE_SHEETS_RIDES_WORKSHEET_NAME,
-    "Rides"
+    resolvedGoogleSheetsRange || resolvedGoogleWorksheetName || "Rides"
   ),
   googleNeedsReviewRange: resolveWorksheetRange(
     process.env.GOOGLE_SHEETS_NEEDS_REVIEW_RANGE,
@@ -237,6 +237,7 @@ const env = Object.freeze({
     false
   ),
   defaultCurrency: safeString(process.env.DEFAULT_CURRENCY, "PKR").toUpperCase(),
+  appTimeZone: safeString(process.env.APP_TIME_ZONE, "Europe/London"),
   fareBase: parseNumber(process.env.FARE_BASE, 250, { min: 0 }),
   farePerKm: parseNumber(process.env.FARE_PER_KM, 95, { min: 0 }),
   geocodingProvider: safeString(process.env.GEOCODING_PROVIDER, "nominatim").toLowerCase(),

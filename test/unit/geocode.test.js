@@ -1,6 +1,10 @@
 ﻿const test = require("node:test");
 const assert = require("node:assert/strict");
-const { cleanAddressForGeocoding, createGeocoder } = require("../../src/routing/geocode");
+const {
+  cleanAddressForGeocoding,
+  createGeocoder,
+  buildGeocodeCandidates
+} = require("../../src/routing/geocode");
 const { createSilentLogger } = require("../helpers");
 
 test("cleanAddressForGeocoding removes bullets and pickup/drop labels", () => {
@@ -64,5 +68,67 @@ test("geocoder returns null when provider returns no results", async () => {
 
   const result = await geocoder.geocodeAddress("Drop Off: Unknown place");
   assert.equal(result, null);
+});
+
+test("buildGeocodeCandidates includes exact, postcode, and simplified fallbacks in order", () => {
+  const candidates = buildGeocodeCandidates(
+    "10 Oakland Villas, Hay-on-Wye, Hereford, HR3 5PH"
+  );
+
+  assert.deepEqual(candidates, [
+    {
+      attemptType: "exact",
+      query: "10 Oakland Villas, Hay-on-Wye, Hereford, HR3 5PH"
+    },
+    {
+      attemptType: "postcode",
+      query: "HR3 5PH"
+    },
+    {
+      attemptType: "simplified",
+      query: "Oakland Villas, Hay-on-Wye, Hereford"
+    }
+  ]);
+});
+
+test("geocoder retries postcode and simplified address after exact match misses", async () => {
+  const calls = [];
+  const geocoder = createGeocoder({
+    provider: "nominatim",
+    httpClient: {
+      get: async (_url, config) => {
+        const query = config.params.q;
+        calls.push(query);
+
+        if (query === "Oakland Villas, Hay-on-Wye, Hereford") {
+          return {
+            data: [
+              {
+                lat: "52.0808",
+                lon: "-3.1279",
+                display_name: "Oakland Villas, Hay-on-Wye, Hereford"
+              }
+            ]
+          };
+        }
+
+        return { data: [] };
+      }
+    },
+    logger: createSilentLogger()
+  });
+
+  const result = await geocoder.geocodeAddress(
+    "10 Oakland Villas, Hay-on-Wye, Hereford, HR3 5PH"
+  );
+
+  assert.ok(result);
+  assert.equal(result.lat, 52.0808);
+  assert.equal(result.lng, -3.1279);
+  assert.deepEqual(calls, [
+    "10 Oakland Villas, Hay-on-Wye, Hereford, HR3 5PH",
+    "HR3 5PH",
+    "Oakland Villas, Hay-on-Wye, Hereford"
+  ]);
 });
 

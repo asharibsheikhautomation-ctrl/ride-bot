@@ -7,7 +7,7 @@ const { DedupeStore } = require("./utils/dedupe");
 const { createLocalExtractor } = require("./extraction/localExtractor");
 const { createOpenAiNormalizer } = require("./extraction/openaiNormalizer");
 const { createTesseractOcr } = require("./extraction/tesseractOcr");
-const { normalizeHeaderName } = require("./extraction/schemas");
+const { normalizeHeaderName, STRICT_SHEET_HEADERS } = require("./extraction/schemas");
 const { createGeocoder } = require("./routing/geocode");
 const { createOsrmClient } = require("./routing/osrm");
 const { createSheetsClient, validateSheetsConfig } = require("./sheets/sheetsClient");
@@ -290,6 +290,7 @@ async function verifyWorksheetTargetsReady({
   for (const target of targets) {
     const worksheetName = safeString(target?.worksheetName);
     const minimumHeaders = Array.isArray(target?.minimumHeaders) ? target.minimumHeaders : [];
+    const expectedHeaders = Array.isArray(target?.expectedHeaders) ? target.expectedHeaders : [];
     const headerResponse = await sheetsClient.spreadsheets.values.get({
       spreadsheetId,
       range: `'${worksheetName.replace(/'/g, "''")}'!1:1`
@@ -298,6 +299,28 @@ async function verifyWorksheetTargetsReady({
       ? headerResponse.data.values[0]
       : [];
     const normalizedHeaders = new Set(rawHeaders.map((header) => normalizeHeaderName(header)));
+    if (expectedHeaders.length > 0) {
+      const actualHeaders = rawHeaders.map((header) => normalizeHeaderName(header));
+      const expectedNormalized = expectedHeaders.map((header) => normalizeHeaderName(header));
+      const exactMatch =
+        actualHeaders.length === expectedNormalized.length &&
+        actualHeaders.every((header, index) => header === expectedNormalized[index]);
+
+      if (!exactMatch) {
+        const error = new Error(
+          `Worksheet ${worksheetName} headers do not match strict schema order`
+        );
+        error.code = "SHEETS_HEADERS_MISMATCH";
+        error.details = {
+          worksheetName,
+          expectedHeaders,
+          headers: rawHeaders
+        };
+        throw error;
+      }
+      continue;
+    }
+
     const missingHeaders = minimumHeaders.filter(
       (header) => !normalizedHeaders.has(normalizeHeaderName(header))
     );
@@ -622,11 +645,11 @@ async function bootstrap() {
     worksheetTargets: [
       {
         worksheetName: env.googleRidesWorksheetName,
-        minimumHeaders: ["Refer", "Pickup", "Drop Off", "Raw Message"]
+        expectedHeaders: STRICT_SHEET_HEADERS
       },
       {
         worksheetName: env.googleNeedsReviewWorksheetName,
-        minimumHeaders: ["Raw Message"]
+        expectedHeaders: STRICT_SHEET_HEADERS
       }
     ],
     logger: logger.child({ component: "sheets-startup" })
@@ -665,8 +688,7 @@ async function bootstrap() {
     allowedGroups: env.allowedGroups,
     whatsappClientId: env.whatsappClientId,
     sessionDir: sessionState.sessionPath,
-    worksheetName: env.googleWorksheetName,
-    ridesWorksheetName: env.googleRidesWorksheetName,
+    worksheetName: env.googleRidesWorksheetName,
     needsReviewWorksheetName: env.googleNeedsReviewWorksheetName,
     geocodingProvider: env.geocodingProvider || "",
     sheetsConfigured: Boolean(sheetsClient && env.googleSheetsId),
@@ -679,7 +701,7 @@ async function bootstrap() {
 
   logger.info("Startup summary", {
     stage: "startup",
-    reason: `allowedGroups=${bootSummary.allowedGroups.length}, clientId=${bootSummary.whatsappClientId}, sessionDir=${bootSummary.sessionDir}, geocoder=${bootSummary.geocodingProvider}, sheetsConfigured=${bootSummary.sheetsConfigured}, sheetsCredentials=${bootSummary.googleCredentialsSource || "unknown"}, openaiConfigured=${bootSummary.openaiConfigured}`
+    reason: `allowedGroups=${bootSummary.allowedGroups.length}, clientId=${bootSummary.whatsappClientId}, sessionDir=${bootSummary.sessionDir}, geocoder=${bootSummary.geocodingProvider}, sheetsConfigured=${bootSummary.sheetsConfigured}, sheetsCredentials=${bootSummary.googleCredentialsSource || "unknown"}, openaiConfigured=${bootSummary.openaiConfigured}, ridesSheet=${bootSummary.worksheetName}, reviewSheet=${bootSummary.needsReviewWorksheetName}`
   });
   logger.debug("Startup details", {
     stage: "startup",
